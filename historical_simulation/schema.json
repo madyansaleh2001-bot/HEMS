@@ -1,0 +1,29 @@
+{
+  "name": "house_XX_model_dataset.csv",
+  "description": "One row per original source timestamp (all rows kept, including the final endpoint). Power columns are SIMULATED available PV potential in watts, not measured generation. No index column.",
+  "header": "Timestamp,House_ID,Panel_Tilt_rad,Panel_Azimuth_rad,Temperature,Relative Humidity,GHI,DNI,DHI,Wind Speed,Solar_Zenith_rad,Solar_Azimuth_rad,PV_Power_Generation_W,PV_AC_Power_W,Panel_Count,Panel_STC_Power_W,Array_STC_Power_W,Inverter_Unit_Count,Inverter_AC_Rated_Power_W,Inverter_Nominal_Efficiency",
+  "columns": [
+    {"name": "Timestamp", "type": "text YYYY-MM-DD HH:MM:SS", "unit": null, "source": "source Timestamp label, reformatted only; no timezone offset added; semantics unconfirmed"},
+    {"name": "House_ID", "type": "integer 1-13", "unit": null, "source": "configuration"},
+    {"name": "Panel_Tilt_rad", "type": "float", "unit": "rad", "source": "user-supplied tilt (degrees) converted to radians"},
+    {"name": "Panel_Azimuth_rad", "type": "float", "unit": "rad", "source": "scenario assumption: 180 deg south = pi; north = 0, clockwise positive"},
+    {"name": "Temperature", "type": "float", "unit": "degC (assumed)", "source": "source value, unchanged"},
+    {"name": "Relative Humidity", "type": "float", "unit": "% (assumed)", "source": "source value, unchanged; not used in the power model"},
+    {"name": "GHI", "type": "float", "unit": "W/m^2 (assumed)", "source": "source value, unchanged"},
+    {"name": "DNI", "type": "float", "unit": "W/m^2 (assumed)", "source": "source value, unchanged"},
+    {"name": "DHI", "type": "float", "unit": "W/m^2 (assumed)", "source": "source value, unchanged"},
+    {"name": "Wind Speed", "type": "float", "unit": "m/s (assumed)", "source": "source value, unchanged"},
+    {"name": "Solar_Zenith_rad", "type": "float", "unit": "rad", "source": "source 'Sun Zenith (rad)', unchanged"},
+    {"name": "Solar_Azimuth_rad", "type": "float", "unit": "rad", "source": "source 'Sun Azimuth (rad)', unchanged"},
+    {"name": "PV_Power_Generation_W", "type": "float", "unit": "W", "source": "simulated array DC after the 10 % aggregate DC loss, before AC conversion; no battery/load/MPPT curtailment"},
+    {"name": "PV_AC_Power_W", "type": "float", "unit": "W", "source": "simulated aggregate PV-only inverter AC output after conversion and clipping; excludes battery/grid and load"},
+    {"name": "Panel_Count", "type": "integer", "unit": null, "source": "authorized illustrative scenario"},
+    {"name": "Panel_STC_Power_W", "type": "number", "unit": "W", "source": "user-supplied Pmax per panel at STC"},
+    {"name": "Array_STC_Power_W", "type": "number", "unit": "W", "source": "Panel_Count x Panel_STC_Power_W"},
+    {"name": "Inverter_Unit_Count", "type": "integer", "unit": null, "source": "1 for string/hybrid scenarios; one per panel for microinverter scenarios"},
+    {"name": "Inverter_AC_Rated_Power_W", "type": "number", "unit": "W", "source": "aggregate rating = units x per-unit AC rating"},
+    {"name": "Inverter_Nominal_Efficiency", "type": "float fraction", "unit": null, "source": "generic nominal PVWatts parameter (not instantaneous efficiency)"}
+  ],
+  "not_exported": ["Fill_Flag", "Record_Type", "POA_Global_Wm2", "PV_Cell_Temperature_C", "Inverter_Type"],
+  "not_exported_note": "POA irradiance and cell temperature are still computed internally; the inverter architecture is kept in simulation_config.json and metadata/run_metadata.json."
+}

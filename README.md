@@ -49,6 +49,13 @@ pvforecast today --config my_site.json --weather-json wx.json      # replay an a
 - **Forecast history:** a run never gives values to rows that had already finished when it was issued. A completed row is compared with the latest run issued at or before the row started.
 - **Accuracy:** implements spec §9 exactly. Row agreement is `max(0, 100 − APE)` with actual power as the denominator. Rows with low output show "N/A". Summaries use duration-weighted WAPE, never averaged row percentages. Agreement is not a probability.
 
+## Historical PV simulation (Weather House 1–13)
+
+`historical_simulation/` is a standalone pvlib script that turns the 13 Spanish weather CSVs into
+20-column simulated DC/AC datasets. It is separate from the forecast core. See
+[`historical_simulation/README.md`](historical_simulation/README.md). The real input files have
+not been available in this environment yet, so it has only been run on synthetic test data.
+
 ## Repository layout
 
 ```
@@ -57,4 +64,5 @@ backend/
   tests/            acceptance checks from spec §11 plus unit tests
   examples/         placeholder configuration (not the user's site)
 docs/               specifications and implementation notes
+historical_simulation/  simulate_pv.py · simulation_config.json · schema.json · tests (synthetic data only)
 ```
