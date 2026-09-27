@@ -1,0 +1,37 @@
+{
+  "_comment": "ILLUSTRATIVE EXAMPLE ONLY. The coordinates (NREL campus, Golden, Colorado) and the panel values are placeholders for exercising the software; they are NOT the user's site, panels or array capacity. Replace them with the real installation before using any output.",
+  "place": {
+    "place_id": "example-place",
+    "name": "Example site (placeholder)",
+    "latitude": 39.7407,
+    "longitude": -105.1686,
+    "timezone": null
+  },
+  "installation": {
+    "installation_id": "example-array",
+    "name": "Example roof array (placeholder)",
+    "config_version": 1,
+    "measurement_boundary": "pv_dc_input",
+    "refresh_minutes": 15,
+    "inverter": {"preset": "felicity_ivem4024_ii"},
+    "losses": {},
+    "sub_arrays": [
+      {
+        "name": "Roof (placeholder)",
+        "panel_count": 6,
+        "tilt_deg": 25,
+        "azimuth_deg": 180,
+        "mounting": "close_roof_mount",
+        "panel": {
+          "source": "illustrative_example",
+          "model_id": null,
+          "rated_power_w": 500,
+          "gamma_percent_per_c": -0.30,
+          "efficiency": null,
+          "length_m": null,
+          "width_m": null
+        }
+      }
+    ]
+  }
+}
