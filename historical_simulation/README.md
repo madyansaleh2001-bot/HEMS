@@ -7,7 +7,33 @@ into one 20-column modelling dataset per house using pvlib.
 > include no battery, load, grid or MPPT curtailment. Because there are no measured targets or
 > saved forecasts, they cannot show real forecast accuracy.
 
-## Run it
+## Run it in VS Code (one file per house)
+
+1. Unzip the package into a folder, e.g. `C:\Users\MI Electronics\Downloads\pv_simulation`, and open that
+   folder in VS Code (**File → Open Folder**).
+2. **Terminal → New Terminal**, then (Python 3.12 must be installed):
+   ```bat
+   py -3.12 -m venv .venv
+   .venv\Scripts\pip install -r requirements.txt
+   ```
+3. **Ctrl+Shift+P → "Python: Select Interpreter"** → pick `.venv`.
+4. Open `house_01.py` … `house_13.py` and press **▶ Run Python File**. Each one audits its
+   `Weather House N.csv`, simulates it and validates the result. It writes to
+   `Downloads\pv_house_outputs\`:
+   - `model_datasets\house_NN_model_dataset.csv`
+   - `metadata\house_NN_audit.json`
+   - `metadata\house_NN_validation.json`
+   - `metadata\house_NN_run_metadata.json`
+   - `house_NN_energy_summary.csv`
+
+   Rerunning a house replaces only that house's own files.
+5. `run_all_houses.py` runs all 13 into `Downloads\pv_simulation_output\` and builds `pv_model_datasets.zip`.
+
+`INPUT_DIR` and `OUTPUT_DIR` are at the top of each file. The house settings are in its `HOUSE`
+block. If you edit them, the change is printed and recorded in the metadata as an edited
+scenario. Every house file uses `simulate_pv.py` and `simulation_config.json` from the same folder.
+
+## Run it from a terminal
 
 ```bat
 :: Windows, Python 3.12

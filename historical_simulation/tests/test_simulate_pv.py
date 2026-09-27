@@ -221,6 +221,7 @@ def test_reference_comparison_and_input_protection(inputs, tmp_path):
 
 
 def test_missing_input_is_reported(tmp_path):
+    assert sp.main(["--input-dir", str(tmp_path / "nope"), "--output-dir", str(tmp_path / "o")]) == 2
     empty = tmp_path / "empty"
     empty.mkdir()
     out = tmp_path / "out"
@@ -236,3 +237,69 @@ def test_existing_results_are_not_silently_mixed(inputs, tmp_path):
     assert sp.main(["--input-dir", str(inputs), "--output-dir", str(out), "--houses", "1", "--overwrite"]) == 0
     assert not (out / "model_datasets" / "house_02_model_dataset.csv").exists()  # stale result removed
     assert (out / "model_datasets" / "house_01_model_dataset.csv").exists()
+
+
+def _load_house_file(house_id: int):
+    import importlib.util
+
+    path = ROOT / f"house_{house_id:02d}.py"
+    spec = importlib.util.spec_from_file_location(f"house_{house_id:02d}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # the __main__ guard keeps it from running
+    return module
+
+
+@pytest.mark.parametrize("house_id", range(1, 14))
+def test_house_files_match_the_configuration(config, house_id):
+    module = _load_house_file(house_id)
+    reference = config.houses[house_id]
+    assert {k: getattr(reference, k) for k in sp.REQUIRED_HOUSE_KEYS} == module.HOUSE
+    assert str(module.INPUT_DIR) == r"C:\Users\MI Electronics\Downloads" or module.INPUT_DIR.name == "Downloads"
+
+
+def test_single_house_run_matches_the_full_run(inputs, tmp_path, config):
+    full = tmp_path / "full"
+    assert sp.main(["--input-dir", str(inputs), "--output-dir", str(full), "--houses", "3,8"]) == 0
+    single = tmp_path / "single"
+    for house_id in (3, 8):
+        assert sp.run_single_house(_load_house_file(house_id).HOUSE, inputs, single) == 0
+        name = f"model_datasets/house_{house_id:02d}_model_dataset.csv"
+        assert (single / name).read_bytes() == (full / name).read_bytes()
+    meta = json.loads((single / "metadata" / "house_08_run_metadata.json").read_text(encoding="utf-8"))
+    assert meta["settings_differ_from_simulation_config"] == {}
+    assert meta["house"]["notes"] == list(config.houses[8].notes)
+    assert (single / "house_08_energy_summary.csv").exists()
+
+
+def test_single_house_rerun_replaces_only_its_own_results(inputs, tmp_path):
+    out = tmp_path / "out"
+    h1, h2 = _load_house_file(1).HOUSE, _load_house_file(2).HOUSE
+    assert sp.run_single_house(h1, inputs, out) == 0
+    assert sp.run_single_house(h2, inputs, out) == 0
+    edited = {**h2, "panel_count": 6}
+    assert sp.run_single_house(edited, inputs, out) == 0
+    meta = json.loads((out / "metadata" / "house_02_run_metadata.json").read_text(encoding="utf-8"))
+    assert meta["settings_differ_from_simulation_config"]["panel_count"] == {"house_file": 6, "simulation_config": 12}
+    res = pd.read_csv(out / "model_datasets" / "house_02_model_dataset.csv")
+    assert res["Array_STC_Power_W"].eq(6 * 540).all()
+    # a defect in house 2's source now blocks it and removes its stale dataset, leaving house 1 untouched
+    path = inputs / "Weather House 2.csv"
+    lines = path.read_text(encoding="utf-8").split("\n")
+    lines.pop(20)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    assert sp.run_single_house(h2, inputs, out) == 1
+    assert not (out / "model_datasets" / "house_02_model_dataset.csv").exists()
+    assert (out / "model_datasets" / "house_01_model_dataset.csv").exists()
+    assert sp.run_single_house(h2, inputs, inputs) == 2
+    missing = tmp_path / "no_such_folder"
+    assert sp.run_single_house(h2, missing, missing / "out") == 2
+    assert not missing.exists()  # nothing is created under a wrong INPUT_DIR
+
+
+def test_house_settings_are_checked():
+    with pytest.raises(sp.ConfigError):
+        sp.make_house({**_load_house_file(3).HOUSE, "inverter_unit_count": 1})  # micro needs one unit per panel
+    with pytest.raises(sp.ConfigError):
+        sp.make_house({**_load_house_file(1).HOUSE, "inverter_nominal_efficiency": 93})
+    with pytest.raises(sp.ConfigError):
+        sp.make_house({**_load_house_file(1).HOUSE, "panel_count": 10.5})

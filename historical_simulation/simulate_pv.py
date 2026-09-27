@@ -35,7 +35,7 @@ import zipfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
@@ -181,28 +181,49 @@ def load_config(path: Path) -> Config:
 
     houses: dict[int, House] = {}
     for h in raw["houses"]:
-        house = House(**{**h, "notes": tuple(h.get("notes", ()))})
-        problems = []
+        house = make_house(h)
         if house.house_id in houses:
-            problems.append("duplicate house_id")
-        if house.panel_count <= 0 or house.inverter_unit_count <= 0:
-            problems.append("panel and inverter counts must be positive")
-        if house.inverter_type not in ("hybrid", "string", "micro"):
-            problems.append("inverter_type must be hybrid, string or micro")
-        if house.inverter_type == "micro" and house.inverter_unit_count != house.panel_count:
-            problems.append("microinverter scenarios use one unit per panel")
-        if house.inverter_type != "micro" and house.inverter_unit_count != 1:
-            problems.append("string/hybrid scenarios use one inverter unit")
-        if not 0.0 < house.inverter_nominal_efficiency <= 1.0:
-            problems.append("inverter_nominal_efficiency must be a fraction, e.g. 0.93")
-        if not -0.02 <= house.gamma_pdc_per_c <= 0.0:
-            problems.append("gamma_pdc_per_c must be a fraction per degC, e.g. -0.0035")
-        if not 0.0 <= house.tilt_deg <= 90.0 or not 0.0 <= house.azimuth_deg < 360.0:
-            problems.append("tilt must be 0-90 deg and azimuth 0-360 deg")
-        if problems:
-            raise ConfigError(f"house {house.house_id}: " + "; ".join(problems))
+            raise ConfigError(f"house {house.house_id}: duplicate house_id")
         houses[house.house_id] = house
     return Config(raw, houses, physics, raw["io"], raw.get("expected_source", {}))
+
+
+REQUIRED_HOUSE_KEYS = (
+    "house_id", "panel_identification", "panel_count", "panel_stc_power_w", "tilt_deg", "azimuth_deg",
+    "gamma_pdc_per_c", "inverter_type", "inverter_unit_count", "inverter_ac_power_w_per_unit",
+    "inverter_nominal_efficiency",
+)
+
+
+def make_house(settings: Mapping[str, Any], default_notes: tuple[str, ...] = ()) -> House:
+    """Build and check one house's settings (from simulation_config.json or a house_XX.py file)."""
+    missing = [k for k in REQUIRED_HOUSE_KEYS if k not in settings]
+    unknown = sorted(set(settings) - set(House.__dataclass_fields__))
+    if missing or unknown:
+        raise ConfigError(f"house settings: missing {missing}, unknown {unknown}")
+    house = House(**{**settings, "notes": tuple(settings.get("notes", default_notes))})
+    problems = []
+    for key in ("house_id", "panel_count", "inverter_unit_count"):
+        value = getattr(house, key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            problems.append(f"{key} must be a positive whole number")
+    if house.inverter_type not in ("hybrid", "string", "micro"):
+        problems.append("inverter_type must be hybrid, string or micro")
+    elif house.inverter_type == "micro" and house.inverter_unit_count != house.panel_count:
+        problems.append("microinverter scenarios use one unit per panel")
+    elif house.inverter_type != "micro" and house.inverter_unit_count != 1:
+        problems.append("string/hybrid scenarios use one inverter unit")
+    if not house.panel_stc_power_w > 0 or not house.inverter_ac_power_w_per_unit > 0:
+        problems.append("panel and inverter ratings must be positive")
+    if not 0.0 < house.inverter_nominal_efficiency <= 1.0:
+        problems.append("inverter_nominal_efficiency must be a fraction, e.g. 0.93")
+    if not -0.02 <= house.gamma_pdc_per_c <= 0.0:
+        problems.append("gamma_pdc_per_c must be a fraction per degC, e.g. -0.0035")
+    if not 0.0 <= house.tilt_deg <= 90.0 or not 0.0 <= house.azimuth_deg < 360.0:
+        problems.append("tilt must be 0-90 deg and azimuth 0-360 deg")
+    if problems:
+        raise ConfigError(f"house {house.house_id}: " + "; ".join(problems))
+    return house
 
 
 # --------------------------------------------------------------------------- audit
@@ -701,6 +722,154 @@ def energy_summary(house: House, times: pd.DatetimeIndex, sim: pd.DataFrame) -> 
 # --------------------------------------------------------------------------- run
 
 
+@dataclass
+class HouseResult:
+    audit: FileAudit
+    checks: dict[str, Any] | None = None
+    file_entry: dict[str, Any] | None = None
+    energy_rows: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def failed_checks(self) -> list[str]:
+        return [k for k, v in (self.checks or {}).items() if isinstance(v, dict) and v.get("passed") is False]
+
+
+def process_house(house: House, config: Config, input_dir: Path, output_dir: Path, *, reference_dir: Path | None = None,
+                  audit_only: bool = False, with_energy: bool = False) -> HouseResult:
+    """Audit one source file and, only if it is clean, simulate, write and validate that house."""
+    src = input_dir / config.io["input_file_pattern"].format(house_id=house.house_id)
+    audit, weather = audit_file(src, house.house_id, config)
+    result = HouseResult(audit)
+    status = "ok" if audit.ok else "BLOCKED"
+    print(f"House {house.house_id:2d}: audit {status} — {src.name}"
+          + (f" ({audit.data_rows} rows, {audit.first_timestamp} .. {audit.last_timestamp})" if audit.data_rows else ""))
+    for finding in audit.defects:
+        print(f"    DEFECT {finding.check} [{finding.column}] x{finding.count} {finding.detail} {finding.examples[:2]}")
+    for finding in audit.warnings:
+        print(f"    warning {finding.check} [{finding.column}] {finding.detail}")
+    if not audit.ok or audit_only:
+        return result
+
+    out_format = config.io["output_timestamp_format"]
+    sim = simulate(weather.values, weather.times, house, config.physics)
+    frame = build_output(weather, house, sim, out_format)
+    out_path = output_dir / "model_datasets" / config.io["output_file_pattern"].format(house_id=house.house_id)
+    write_csv(frame, out_path)
+    result.checks = validate_output(out_path, weather, house, sim, config.physics, out_format, reference_dir)
+    result.file_entry = {
+        "source": str(src), "source_sha256": audit.sha256, "source_rows": audit.data_rows,
+        "output": str(out_path.relative_to(output_dir)), "output_sha256": sha256_file(out_path), "output_rows": len(frame),
+    }
+    failed = result.failed_checks
+    print(f"           wrote {out_path.relative_to(output_dir)}; validation "
+          + ("passed" if not failed else f"FAILED: {failed}")
+          + f"; max AC {result.checks['ac_not_above_aggregate_rating']['max_ac_w']:.3f} W of {house.inverter_ac_rated_power_w:g} W")
+    if with_energy:
+        result.energy_rows = energy_summary(house, weather.times, sim)
+    return result
+
+
+def _house_record(house: House) -> dict[str, Any]:
+    return {**asdict(house), "array_stc_power_w": house.array_stc_power_w,
+            "inverter_ac_rated_power_w_aggregate": house.inverter_ac_rated_power_w}
+
+
+def _common_metadata(config: Config, config_path: Path, env: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "script_version": SCRIPT_VERSION,
+        "command": sys.argv,
+        "provenance": PROVENANCE_STATEMENT,
+        "source_context": {
+            "origin": "weather datasets collected in Spain (per the paper/user context)",
+            "coordinates": "unconfirmed; not used (solar angles are taken from the source files)",
+            "timezone_and_timestamp_semantics": "unconfirmed; timestamp labels are preserved without localisation or shifting",
+            "units": config.raw.get("source_units"),
+            "fill_flag": "audited only; not used as a predictor and not exported",
+            "completeness_caveat": "a complete file does not prove the provider never filled earlier missing observations",
+        },
+        "environment": env,
+        "config_file": str(config_path),
+        "config_sha256": sha256_file(config_path),
+        "physics": asdict(config.physics),
+        "setting_provenance": config.raw.get("setting_provenance"),
+        "final_columns": FINAL_COLUMNS,
+        "removed_columns": list(REMOVED_COLUMNS),
+    }
+
+
+def _warn_versions(env: dict[str, Any]) -> None:
+    if not env["all_match"]:
+        print(f"WARNING: package versions differ from the reference environment: {env['actual']} vs {env['reference']}. "
+              "Results are recorded with the actual versions; exact numerical equivalence is not claimed.")
+
+
+def run_single_house(settings: Mapping[str, Any], input_dir: str | Path, output_dir: str | Path, *,
+                     config_path: str | Path | None = None, energy_summary_csv: bool = True,
+                     reference_dir: str | Path | None = None) -> int:
+    """Run one house with the settings given in a house_XX.py file (used by the VS Code house scripts).
+
+    Physics, audit rules and file layout come from simulation_config.json. Only this house's own
+    earlier results in output_dir are replaced. Returns 0 when the audit and validation pass.
+    """
+    config_path = Path(config_path or HERE / "simulation_config.json").resolve()
+    config = load_config(config_path)
+    reference = config.houses.get(settings.get("house_id"))
+    house = make_house(settings, default_notes=reference.notes if reference else ())
+    input_dir, output_dir = Path(input_dir).resolve(), Path(output_dir).resolve()
+    if not input_dir.is_dir():
+        print(f"ERROR: INPUT_DIR {input_dir} does not exist; edit INPUT_DIR at the top of the house file", file=sys.stderr)
+        return 2
+    if output_dir == input_dir:
+        print("ERROR: OUTPUT_DIR must differ from INPUT_DIR so the original files are never touched", file=sys.stderr)
+        return 2
+    tag = f"house_{house.house_id:02d}"
+    meta_dir = output_dir / "metadata"
+    stale = [output_dir / "model_datasets" / config.io["output_file_pattern"].format(house_id=house.house_id),
+             output_dir / f"{tag}_energy_summary.csv", *meta_dir.glob(f"{tag}_*.json")]
+    for path in stale:  # only this house's own earlier results
+        if path.is_file():
+            path.unlink()
+
+    env = environment_versions()
+    _warn_versions(env)
+    differences = {}
+    if reference is None:
+        print(f"NOTE: house {house.house_id} is not in simulation_config.json; using the house file settings as given")
+    else:
+        for key in REQUIRED_HOUSE_KEYS:
+            if getattr(house, key) != getattr(reference, key):
+                differences[key] = {"house_file": getattr(house, key), "simulation_config": getattr(reference, key)}
+        if differences:
+            print(f"NOTE: edited scenario — settings differ from simulation_config.json: {differences}")
+
+    result = process_house(house, config, input_dir, output_dir, reference_dir=Path(reference_dir).resolve() if reference_dir else None,
+                           with_energy=energy_summary_csv)
+    write_json(meta_dir / f"{tag}_audit.json", result.audit)
+    if result.checks is not None:
+        write_json(meta_dir / f"{tag}_validation.json", result.checks)
+    if result.energy_rows:
+        pd.DataFrame(result.energy_rows).to_csv(output_dir / f"{tag}_energy_summary.csv", index=False, lineterminator="\n")
+    write_json(meta_dir / f"{tag}_run_metadata.json", {
+        **_common_metadata(config, config_path, env),
+        "run_mode": "single house (house file)",
+        "house": _house_record(house),
+        "settings_differ_from_simulation_config": differences,
+        "file": result.file_entry,
+        "energy_summary": f"{tag}_energy_summary.csv (trapezoidal; source times treated as instantaneous samples)"
+        if result.energy_rows else None,
+    })
+    if not result.audit.ok:
+        print(f"House {house.house_id} BLOCKED by audit defects; no dataset written. See {meta_dir / (tag + '_audit.json')}")
+        return 1
+    if result.failed_checks:
+        print(f"House {house.house_id} validation FAILED: {result.failed_checks}. See {meta_dir / (tag + '_validation.json')}")
+        return 1
+    print(f"Done: {output_dir / result.file_entry['output']}")
+    return 0
+
+
+
 def environment_versions() -> dict[str, Any]:
     import scipy
 
@@ -742,6 +911,9 @@ def run(args: argparse.Namespace) -> int:
     config = load_config(config_path)
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
+    if not input_dir.is_dir():
+        print(f"ERROR: --input-dir {input_dir} does not exist", file=sys.stderr)
+        return 2
     if output_dir == input_dir:
         print("ERROR: --output-dir must differ from --input-dir so the original files are never touched", file=sys.stderr)
         return 2
@@ -764,13 +936,9 @@ def run(args: argparse.Namespace) -> int:
         return 2
 
     env = environment_versions()
-    if not env["all_match"]:
-        print(f"WARNING: package versions differ from the reference environment: {env['actual']} vs {env['reference']}. "
-              "Results are recorded with the actual versions; exact numerical equivalence is not claimed.")
+    _warn_versions(env)
 
-    datasets_dir = output_dir / "model_datasets"
     meta_dir = output_dir / "metadata"
-    out_format = config.io["output_timestamp_format"]
     audits: dict[int, FileAudit] = {}
     validations: dict[int, Any] = {}
     files: dict[int, Any] = {}
@@ -778,36 +946,13 @@ def run(args: argparse.Namespace) -> int:
     reference_dir = Path(args.reference_dir).resolve() if args.reference_dir else None
 
     for house_id in houses:
-        house = config.houses[house_id]
-        src = input_dir / config.io["input_file_pattern"].format(house_id=house_id)
-        audit, weather = audit_file(src, house_id, config)
-        audits[house_id] = audit
-        status = "ok" if audit.ok else "BLOCKED"
-        print(f"House {house_id:2d}: audit {status} — {src.name}"
-              + (f" ({audit.data_rows} rows, {audit.first_timestamp} .. {audit.last_timestamp})" if audit.data_rows else ""))
-        for finding in audit.defects:
-            print(f"    DEFECT {finding.check} [{finding.column}] x{finding.count} {finding.detail} {finding.examples[:2]}")
-        for finding in audit.warnings:
-            print(f"    warning {finding.check} [{finding.column}] {finding.detail}")
-        if not audit.ok or args.audit_only:
-            continue
-
-        sim = simulate(weather.values, weather.times, house, config.physics)
-        frame = build_output(weather, house, sim, out_format)
-        out_path = datasets_dir / config.io["output_file_pattern"].format(house_id=house_id)
-        write_csv(frame, out_path)
-        checks = validate_output(out_path, weather, house, sim, config.physics, out_format, reference_dir)
-        validations[house_id] = checks
-        failed = [k for k, v in checks.items() if isinstance(v, dict) and v.get("passed") is False]
-        files[house_id] = {
-            "source": str(src), "source_sha256": audit.sha256, "source_rows": audit.data_rows,
-            "output": str(out_path.relative_to(output_dir)), "output_sha256": sha256_file(out_path), "output_rows": len(frame),
-        }
-        print(f"           wrote {out_path.relative_to(output_dir)}; validation "
-              + ("passed" if not failed else f"FAILED: {failed}")
-              + f"; max AC {checks['ac_not_above_aggregate_rating']['max_ac_w']:.3f} W of {house.inverter_ac_rated_power_w:g} W")
-        if args.energy_summary:
-            summary_rows.extend(energy_summary(house, weather.times, sim))
+        result = process_house(config.houses[house_id], config, input_dir, output_dir, reference_dir=reference_dir,
+                               audit_only=args.audit_only, with_energy=args.energy_summary)
+        audits[house_id] = result.audit
+        if result.checks is not None:
+            validations[house_id] = result.checks
+            files[house_id] = result.file_entry
+        summary_rows.extend(result.energy_rows)
 
     blocked = sorted(h for h, a in audits.items() if not a.ok)
     failed_validation = sorted(h for h, v in validations.items()
@@ -819,28 +964,9 @@ def run(args: argparse.Namespace) -> int:
         pd.DataFrame(summary_rows).to_csv(output_dir / "energy_summary.csv", index=False, lineterminator="\n")
     total_rows = sum(a.data_rows or 0 for a in audits.values())
     write_json(meta_dir / "run_metadata.json", {
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "script_version": SCRIPT_VERSION,
-        "command": sys.argv,
-        "provenance": PROVENANCE_STATEMENT,
-        "source_context": {
-            "origin": "weather datasets collected in Spain (per the paper/user context)",
-            "coordinates": "unconfirmed; not used (solar angles are taken from the source files)",
-            "timezone_and_timestamp_semantics": "unconfirmed; timestamp labels are preserved without localisation or shifting",
-            "units": config.raw.get("source_units"),
-            "fill_flag": "audited only; not used as a predictor and not exported",
-            "completeness_caveat": "a complete file does not prove the provider never filled earlier missing observations",
-        },
-        "environment": env,
-        "config_file": str(config_path),
-        "config_sha256": sha256_file(config_path),
-        "physics": asdict(config.physics),
-        "setting_provenance": config.raw.get("setting_provenance"),
-        "houses": {str(h): {**asdict(config.houses[h]), "array_stc_power_w": config.houses[h].array_stc_power_w,
-                            "inverter_ac_rated_power_w_aggregate": config.houses[h].inverter_ac_rated_power_w}
-                   for h in houses},
-        "final_columns": FINAL_COLUMNS,
-        "removed_columns": list(REMOVED_COLUMNS),
+        **_common_metadata(config, config_path, env),
+        "run_mode": "all selected houses",
+        "houses": {str(h): _house_record(config.houses[h]) for h in houses},
         "files": {str(h): f for h, f in files.items()},
         "records_audited": total_rows,
         "blocked_houses": blocked,
