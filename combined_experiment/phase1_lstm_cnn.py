@@ -1,37 +1,47 @@
 # =============================================================================
 # COMBINED SAME-DAY + NEXT-DAY EXPERIMENT (Experiment A) — PHASE 1 — LSTM-CNN
-# Google Colab / TensorFlow / Optuna — Strategy 2 split, NO PV LOOKBACK
+# Google Colab / TensorFlow / Optuna — Strategy 2 split — NO PV LOOKBACK
 #
-# Run this file TWICE, once per task:  TASK = 'same_day'  and  TASK = 'next_day'.
-# Each run is an independent experiment with its OWN Optuna study.
-# Hyperparameters are never shared between the two tasks.
+# ONE execution of this file performs BOTH tasks automatically (no TASK switch):
+#   1. SAME-DAY LSTM-CNN  — own Optuna study 'lstm_cnn_same_day', own hyperparameters,
+#      seeds 42/43/44, House-11 metrics, saved models/results.
+#   2. NEXT-DAY LSTM-CNN  — own Optuna study 'lstm_cnn_next_day', own hyperparameters,
+#      seeds 42/43/44, House-11 metrics, saved models/results.
+# Two independent task-specific models (Design B); nothing is shared between them
+# except the data, the scalers fitted on Houses 1-10, and the evaluation code.
 #
-# PHASE 1 ISOLATION (copied from the corrected XGBoost reference):
-#   Only Houses 1-11 are opened. Houses 12-13 are not read, validated,
-#   transformed, scheduled or evaluated here. Their file paths are not even built.
-#   Houses 1-10 = training, House 11 = Optuna / early stopping / checkpoint / selection.
+# ONE OPERATIONAL SCHEDULE RULE FOR BOTH TASKS (FUTURE_OFFSETS = 1..24):
+#   For every target day: first target = first 15-min daylight grid point
+#   (Solar_Zenith_rad < pi/2); first issue = first target - offset - 15 min;
+#   further issues every cadence while the window's FIRST target is daylight.
+#   The issue time itself does NOT need to be daylight.
+#     SAME-DAY : targets = origin + FUTURE_OFFSETS          (t+15 ... t+360)
+#                offset 0 days, cadence 15 min.
+#                Sunrise 07:08 -> first daylight grid 07:15 -> first issue 07:00
+#                -> 07:15 ... 13:00; issue 07:15 -> 07:30 ... 13:15; ...
+#     NEXT-DAY : targets = origin + 96 + FUTURE_OFFSETS     (t+24h15 ... t+30h)
+#                offset 1 day, cadence 2 h.
+#                Tomorrow sunrise 07:08 -> first target 07:15 -> issue today 07:00
+#                -> tomorrow 07:15 ... 13:00; issue 09:00 -> 09:15 ... 15:00; ...
+#   Target positions after sunset are masked from loss/metrics and reported as 0 W.
+#   Same-Day Optuna uses every 4th issue of that schedule (TUNING_STRIDE = 4, hourly)
+#   to save compute; final training and ALL evaluation use the full 15-min schedule.
+#   Next-Day uses its 2-hour schedule for Optuna, training and evaluation.
 #
-# SAME-DAY schedule (exact copy of the Same-Day LSTM reference):
-#   origins every 15 min; keep origin_is_daylight & future_has_daylight;
-#   targets = origin + 1 ... origin + 24  (t+15 ... t+360);
-#   Optuna on TUNING_STRIDE = 4 (hourly) origins, final fit/evaluation FINAL_STRIDE = 1.
-#   Example: sunrise 07:08 -> 07:00 excluded, 07:15 first issue -> 07:30 ... 13:15.
-#
-# NEXT-DAY schedule (exact copy of the corrected XGBoost / Next-Day LSTM-CNN references):
-#   first target of each target day = its first 15-min daylight grid point;
-#   issue = first target - 96 - 1 steps; then every 8 steps (2 h) while the first
-#   target is daylight; targets = origin + 96 + 1 ... origin + 96 + 24.
-#   Example: sunrise 07:08 -> first daylight 07:15 -> issue today 07:00 -> 07:15 ... 13:00.
-#   The same operational schedule is used for Optuna, final fitting and validation.
+# PHASE 1 ISOLATION: only Houses 1-11 are opened. Houses 12-13 are not read,
+# validated, transformed, scheduled or evaluated here; their paths are not even built.
+# Houses 1-10 = training, House 11 = Optuna / early stopping / checkpoint / selection.
 #
 # Inputs: 24 x 8 target-time weather + 3 static PV-system parameters only.
 # Target: PV_DC_Power_W / Array_Rated_Power_W (synthetic pvlib DC target in Experiment A).
-# Training/tuning loss: daylight-masked MSE of the RAW per-unit output (no clipping).
-# Reporting: predictions clipped >= 0 and forced to exactly 0 at night.
-# Final frozen configuration retrained with seeds 42, 43, 44 (mean ± SD reported).
-# Deployment seed: 42 (predefined; never the best-performing seed).
+# Optuna objective: House-11 daylight-masked MSE of the RAW per-unit output.
+# Optuna storage: persistent SQLite on Drive, load_if_exists=True (resumable).
+# Reporting: predictions clipped >= 0 and exactly 0 W at night.
+# Final frozen configuration retrained with seeds 42, 43, 44 (mean ± SD); deployment seed 42.
 # Metrics: Primary RMSE, MAE, nRMSE, WAPE, R2 | Secondary sMAPE |
 #          Supplementary MAPE_1pct (+ N included / N excluded) | HEMS planning metrics.
+# Resuming: a task whose phase1_summary.json exists is skipped; an unfinished task
+# resumes its Optuna study and then repeats its final seed training.
 # =============================================================================
 
 import os, gc, json, math, random, hashlib
@@ -48,11 +58,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
-# -----------------------------------------------------------------------------
-# RUN SETTING — change and run again for the second task.
-# -----------------------------------------------------------------------------
-TASK = 'same_day'              # 'same_day' or 'next_day'
-OVERWRITE_PHASE1_RUN = False   # True only to deliberately redo an unfinished/invalid run
+OVERWRITE_PHASE1_RUN = False   # True only to deliberately redo an already completed task
 
 # >>> ARCHITECTURE IDENTITY (architecture-specific) >>>
 ARCH_KEY = 'lstm_cnn'
@@ -81,15 +87,11 @@ try:
 except ImportError:
     display = print
 
-TASKS = ('same_day', 'next_day')
-if TASK not in TASKS:
-    raise ValueError(f'TASK must be one of {TASKS}, got {TASK!r}.')
+TASKS = ('same_day', 'next_day')   # both tasks run automatically, in this order
 
 EXPERIMENT_DIR = DATA_DIR / 'combined_sameday_nextday_experiment'
 PHASE1_DIR = EXPERIMENT_DIR / 'phase1'
 SELECTION_FILE = EXPERIMENT_DIR / 'frozen_selection.json'
-RUN_DIR = PHASE1_DIR / f'{ARCH_KEY}_{TASK}'
-MODEL_DIR = RUN_DIR / 'models'
 
 # Phase-1 lock: once the architecture decision is frozen, Phase 1 may not be re-run.
 if SELECTION_FILE.exists():
@@ -97,13 +99,7 @@ if SELECTION_FILE.exists():
         f'{SELECTION_FILE} exists: the architecture decision is frozen. '
         'Phase 1 must not be re-run after selection.'
     )
-if (RUN_DIR / 'phase1_summary.json').exists() and not OVERWRITE_PHASE1_RUN:
-    raise RuntimeError(
-        f'{RUN_DIR} already holds a completed Phase-1 run. '
-        'Set OVERWRITE_PHASE1_RUN = True only if you deliberately redo it.'
-    )
-RUN_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
+PHASE1_DIR.mkdir(parents=True, exist_ok=True)
 
 TRAIN_HOUSES = list(range(1, 11))
 VAL_HOUSES = [11]
@@ -114,22 +110,22 @@ HORIZON = 24
 STEP_MIN = 15
 STEPS_PER_DAY = (24 * 60) // STEP_MIN  # 96
 DAY_AHEAD_OFFSET_STEPS = STEPS_PER_DAY
+FUTURE_OFFSETS = np.arange(1, HORIZON + 1, dtype=np.int32)   # 1 ... 24
+SAME_DAY_CADENCE_STEPS = 1                                    # every 15 min
 DEPLOYMENT_UPDATE_HOURS = 2
-DEPLOYMENT_CADENCE_STEPS = (DEPLOYMENT_UPDATE_HOURS * 60) // STEP_MIN  # 8
-TUNING_STRIDE = 4   # same-day only: every hour during Optuna
-FINAL_STRIDE = 1    # same-day only: every 15 min for final fit/evaluation
+DEPLOYMENT_CADENCE_STEPS = (DEPLOYMENT_UPDATE_HOURS * 60) // STEP_MIN  # 8 = every 2 h
+TUNING_STRIDE = 4   # Same-Day Optuna only: every 4th operational issue (hourly)
 OPTUNA_TRIALS = 20
 TUNING_EPOCHS = 15
 FINAL_EPOCHS = 60
 PATIENCE = 8
 MAPE_THRESHOLD_PU = 0.01  # supplementary MAPE only when actual PV >= 1% of rated power
 
-# Task timing: same-day targets start at origin + 1; next-day at origin + 96 + 1.
-TARGET_OFFSET_STEPS = 0 if TASK == 'same_day' else DAY_AHEAD_OFFSET_STEPS
-# Same-day: hourly origins for Optuna, every 15 min afterwards (reference workflow).
-# Next-day: the exact operational schedule everywhere (no stride).
-TUNE_STRIDE_FOR_TASK = TUNING_STRIDE if TASK == 'same_day' else None
-FINAL_STRIDE_FOR_TASK = FINAL_STRIDE if TASK == 'same_day' else None
+# The only temporal difference between the tasks: offset (0 / 1 day) and refresh cadence.
+TASK_TARGET_OFFSET_STEPS = {'same_day': 0, 'next_day': DAY_AHEAD_OFFSET_STEPS}
+TASK_OPERATIONAL_CADENCE_STEPS = {'same_day': SAME_DAY_CADENCE_STEPS, 'next_day': DEPLOYMENT_CADENCE_STEPS}
+TASK_TUNING_CADENCE_STEPS = {'same_day': SAME_DAY_CADENCE_STEPS * TUNING_STRIDE,
+                              'next_day': DEPLOYMENT_CADENCE_STEPS}
 
 FUTURE_FEATURES = [
     'Temperature', 'Relative Humidity', 'GHI', 'DNI', 'DHI', 'Wind Speed',
@@ -148,7 +144,7 @@ HOUSE_FILES = {h: DATA_DIR / f'house_{h:02d}_model_dataset.csv' for h in PRETEST
 missing_pretest = [str(p) for p in HOUSE_FILES.values() if not p.exists()]
 if missing_pretest:
     raise FileNotFoundError('Missing train/validation files:\n' + '\n'.join(missing_pretest))
-print(f'{ARCH_LABEL} | TASK = {TASK} | train/validation files found. '
+print(f'{ARCH_LABEL} | tasks = {TASKS} | train/validation files found. '
       'Houses 12-13 are not accessed in Phase 1.')
 
 
@@ -230,7 +226,7 @@ for h in PRETEST_HOUSES:
     house_file_sha256[h] = file_sha256(HOUSE_FILES[h])
     print(f"House {h:02d}: {len(houses[h]['pv_w']):,} rows, rated={houses[h]['rated']:.1f} W")
 
-# Fit scalers ONLY on training Houses 1-10 (same definition for both tasks).
+# Fit scalers ONLY on training Houses 1-10 (one definition shared by both tasks).
 future_scaler = StandardScaler()
 for h in TRAIN_HOUSES:
     future_scaler.partial_fit(houses[h]['future_raw'])
@@ -242,49 +238,36 @@ for h in PRETEST_HOUSES:
     houses[h]['static'] = static_scaler.transform(
         houses[h]['static_raw'].reshape(1, -1)
     )[0].astype(np.float32)
-joblib.dump(future_scaler, RUN_DIR / 'future_weather_scaler.joblib')
-joblib.dump(static_scaler, RUN_DIR / 'static_scaler.joblib')
 
 
 # -----------------------------------------------------------------------------
-# SAME-DAY index — exact copy of the Same-Day LSTM reference.
-# -----------------------------------------------------------------------------
-def build_index(house_ids, stride):
-    hs, origins_all = [], []
-    future_offsets = np.arange(1, HORIZON + 1, dtype=np.int32)
-    for h in house_ids:
-        d = houses[h]
-        # Same-day forecast origins. Final stride=1 means every 15 minutes.
-        origins = np.arange(0, len(d['pv_pu']) - HORIZON, stride, dtype=np.int32)
-        future_idx = origins[:, None] + future_offsets[None, :]
-
-        # Keep the original same-day sunrise/sunset rule:
-        # the issue time itself must be daylight, and the future 6-hour
-        # window must contain at least one daylight target.
-        # Example: sunrise 07:08 -> 07:00 excluded, 07:15 included.
-        origin_is_daylight = d['daylight'][origins]
-        future_has_daylight = np.any(d['daylight'][future_idx], axis=1)
-        origins = origins[origin_is_daylight & future_has_daylight]
-
-        hs.append(np.full(len(origins), h, np.int16))
-        origins_all.append(origins)
-
-    if not origins_all:
-        return np.empty(0, np.int16), np.empty(0, np.int32)
-    return np.concatenate(hs), np.concatenate(origins_all)
-
-
-# -----------------------------------------------------------------------------
-# NEXT-DAY index — exact copy of the corrected XGBoost / LSTM-CNN references.
+# OPERATIONAL SCHEDULE — one rule for both tasks.
 # -----------------------------------------------------------------------------
 _OPERATIONAL_ORIGIN_CACHE = {}
 
 
-def operational_origins_for_house(h):
-    """Return cached exact operational origins for one house."""
-    h = int(h)
-    if h in _OPERATIONAL_ORIGIN_CACHE:
-        return _OPERATIONAL_ORIGIN_CACHE[h]
+def operational_origins_for_house(h, offset_steps, cadence_steps):
+    """
+    Exact operational issue indices (origins) for one house.
+
+    For every target day:
+      first target = first 15-minute daylight grid point of that day;
+      first issue  = first target - offset_steps - 1 step;
+      then one issue every cadence_steps while the window's FIRST target is
+      still daylight on that same target day. The issue itself need not be daylight.
+    Targets of an issue = origin + offset_steps + FUTURE_OFFSETS (1..24).
+
+    Same-Day: offset_steps = 0,  cadence_steps = 1 (15 min).
+      sunrise 07:08 -> first target 07:15 -> issue 07:00 -> 07:15 ... 13:00,
+      issue 07:15 -> 07:30 ... 13:15, ...
+    Next-Day: offset_steps = 96, cadence_steps = 8 (2 h).
+      tomorrow sunrise 07:08 -> first target 07:15 -> issue today 07:00 ->
+      tomorrow 07:15 ... 13:00, issue 09:00 -> 09:15 ... 15:00, ...
+    """
+    key = (int(h), int(offset_steps), int(cadence_steps))
+    if key in _OPERATIONAL_ORIGIN_CACHE:
+        return _OPERATIONAL_ORIGIN_CACHE[key]
+    h, offset_steps, cadence_steps = key
 
     d = houses[h]
     ts = pd.DatetimeIndex(d['timestamps'])
@@ -297,12 +280,10 @@ def operational_origins_for_house(h):
         return_counts=True,
     )
 
+    first_target_delta = pd.Timedelta(minutes=(offset_steps + 1) * STEP_MIN)
     house_origins = []
 
-    # The first target date has no previous-day issue inside the file.
-    for target_date64, day_start, day_count in zip(
-        unique_dates[1:], day_starts[1:], day_counts[1:]
-    ):
+    for target_date64, day_start, day_count in zip(unique_dates, day_starts, day_counts):
         day_idx = np.arange(
             int(day_start),
             int(day_start + day_count),
@@ -312,26 +293,26 @@ def operational_origins_for_house(h):
         if len(daylight_idx) == 0:
             continue
 
-        # First prediction = first 15-minute daylight timestamp of target day.
+        # First prediction = first 15-minute daylight timestamp of the target day.
         first_target_idx = int(daylight_idx[0])
 
-        # target = issue + 24h + 15min, therefore:
-        # issue = first_target - 96 steps - 1 step.
-        first_origin = first_target_idx - DAY_AHEAD_OFFSET_STEPS - 1
+        # first target = issue + offset + 15 min, therefore:
+        # issue = first target - offset steps - 1 step.
+        first_origin = first_target_idx - offset_steps - 1
         if first_origin < 0:
+            # e.g. the first target day of the file for Next-Day: no issue inside the file.
             continue
 
         k = 0
         while True:
-            origin = first_origin + k * DEPLOYMENT_CADENCE_STEPS
-            reference_idx = origin + DAY_AHEAD_OFFSET_STEPS
-            first_pred_idx = reference_idx + 1
-            last_pred_idx = reference_idx + HORIZON
+            origin = first_origin + k * cadence_steps
+            first_pred_idx = origin + offset_steps + 1
+            last_pred_idx = origin + offset_steps + HORIZON
 
             if last_pred_idx >= len(ts):
                 break
 
-            # Stop if the later 2-hour slot moved into another target day.
+            # Stop if the later slot moved into another target day.
             if normalized_dates[first_pred_idx] != target_date64:
                 break
 
@@ -340,17 +321,16 @@ def operational_origins_for_house(h):
                 break
 
             issue_ts = ts[origin]
-            reference_ts = ts[reference_idx]
             first_target_ts = ts[first_pred_idx]
 
             # Hard timing checks.
-            if reference_ts - issue_ts != pd.Timedelta(hours=24):
+            if first_target_ts - issue_ts != first_target_delta:
+                raise RuntimeError(
+                    f'House {h:02d}: first target is not issue + {first_target_delta} at {issue_ts}.'
+                )
+            if offset_steps == DAY_AHEAD_OFFSET_STEPS and ts[origin + offset_steps] - issue_ts != pd.Timedelta(hours=24):
                 raise RuntimeError(
                     f'House {h:02d}: next-day reference is not exactly +24 h at {issue_ts}.'
-                )
-            if first_target_ts - issue_ts != pd.Timedelta(hours=24, minutes=15):
-                raise RuntimeError(
-                    f'House {h:02d}: first target is not exactly +24 h 15 min at {issue_ts}.'
                 )
 
             # The first operational window of each target day MUST start
@@ -364,17 +344,17 @@ def operational_origins_for_house(h):
             k += 1
 
     out = np.asarray(house_origins, dtype=np.int32)
-    _OPERATIONAL_ORIGIN_CACHE[h] = out
+    _OPERATIONAL_ORIGIN_CACHE[key] = out
     return out
 
 
-def build_operational_index(house_ids):
-    """Exact next-day schedule used everywhere in this experiment."""
+def build_task_index(house_ids, cadence_steps):
+    """Operational schedule of the CURRENT task for several houses."""
     hs = []
     origins_all = []
 
     for h in house_ids:
-        origins = operational_origins_for_house(int(h))
+        origins = operational_origins_for_house(int(h), TARGET_OFFSET_STEPS, cadence_steps)
         if len(origins) == 0:
             continue
         hs.append(np.full(len(origins), int(h), dtype=np.int16))
@@ -386,30 +366,21 @@ def build_operational_index(house_ids):
     return np.concatenate(hs), np.concatenate(origins_all)
 
 
-def build_task_index(house_ids, stride):
-    """Same-day: reference build_index(stride). Next-day: operational schedule."""
-    if TASK == 'same_day':
-        return build_index(house_ids, stride)
-    return build_operational_index(house_ids)
-
-
-def build_schedule_audit(house_ids, stride):
+def build_schedule_audit(house_ids, cadence_steps):
     """Human-readable timing audit (one row per retained forecast window)."""
-    sample_house, sample_origin = build_task_index(house_ids, stride)
+    sample_house, sample_origin = build_task_index(house_ids, cadence_steps)
     rows = []
     for h in np.unique(sample_house):
         d = houses[int(h)]
         origins = sample_origin[sample_house == h].astype(np.int64)
-        first_idx = origins + TARGET_OFFSET_STEPS + 1
-        last_idx = origins + TARGET_OFFSET_STEPS + HORIZON
-        fidx = origins[:, None] + TARGET_OFFSET_STEPS + np.arange(1, HORIZON + 1)[None, :]
+        fidx = origins[:, None] + TARGET_OFFSET_STEPS + FUTURE_OFFSETS[None, :]
         rows.append(pd.DataFrame({
             'House': int(h),
             'Issue_Timestamp': d['timestamps'][origins],
             'Issue_Daylight': d['daylight'][origins],
-            'First_Target_Timestamp': d['timestamps'][first_idx],
-            'Last_Target_Timestamp': d['timestamps'][last_idx],
-            'First_Target_Daylight': d['daylight'][first_idx],
+            'First_Target_Timestamp': d['timestamps'][fidx[:, 0]],
+            'Last_Target_Timestamp': d['timestamps'][fidx[:, -1]],
+            'First_Target_Daylight': d['daylight'][fidx[:, 0]],
             'Daylight_Target_Count': d['daylight'][fidx].sum(axis=1).astype(int),
         }))
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
@@ -422,25 +393,17 @@ def schedule_sha256(sample_house, sample_origin):
     return h.hexdigest()
 
 
-# Schedule audit for Houses 1-11 only (Houses 12-13 are audited in Phase 2).
-schedule_audit = build_schedule_audit(PRETEST_HOUSES, FINAL_STRIDE_FOR_TASK)
-schedule_audit.to_csv(RUN_DIR / 'operational_schedule_audit_houses_01_11.csv.gz', index=False)
-print(f'Schedule audit (Houses 1-11): {len(schedule_audit):,} windows')
-val_final_house, val_final_origin = build_task_index(VAL_HOUSES, FINAL_STRIDE_FOR_TASK)
-VAL_SCHEDULE_SHA256 = schedule_sha256(val_final_house, val_final_origin)
-
-
 # -----------------------------------------------------------------------------
 # Keras data pipeline — same packed target/mask format as the references.
 # -----------------------------------------------------------------------------
 class MultiHouseSequence(tf.keras.utils.Sequence):
-    def __init__(self, house_ids, batch_size, stride, shuffle):
+    def __init__(self, house_ids, batch_size, cadence_steps, shuffle):
         super().__init__()
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
-        self.sample_house, self.sample_origin = build_task_index(house_ids, stride)
+        self.sample_house, self.sample_origin = build_task_index(house_ids, cadence_steps)
         self.order = np.arange(len(self.sample_origin), dtype=np.int64)
-        self.future_offsets = np.arange(1, HORIZON + 1, dtype=np.int32)
+        self.future_offsets = FUTURE_OFFSETS
         self.on_epoch_end()
 
     def __len__(self):
@@ -603,10 +566,9 @@ def objective(trial):
     params = suggest_params(trial)
     batch = int(params['batch_size'])
 
-    # Same-day: hourly origins (TUNING_STRIDE) as in the reference.
-    # Next-day: the exact operational schedule.
-    tr = MultiHouseSequence(TRAIN_HOUSES, batch, TUNE_STRIDE_FOR_TASK, True)
-    va = MultiHouseSequence(VAL_HOUSES, batch, TUNE_STRIDE_FOR_TASK, False)
+    # Same-Day: every 4th operational issue (hourly). Next-Day: its 2-hour schedule.
+    tr = MultiHouseSequence(TRAIN_HOUSES, batch, TUNE_CADENCE, True)
+    va = MultiHouseSequence(VAL_HOUSES, batch, TUNE_CADENCE, False)
 
     model = build_model(params)
     hist = model.fit(
@@ -881,8 +843,14 @@ def evaluate_predictions(meta, raw_pred_pu, name):
     }
 
 
+def mean_sd_table(rows):
+    df = pd.DataFrame(rows)
+    num = df.drop(columns=[c for c in ('Seed', 'Split') if c in df.columns]).astype(float)
+    return pd.DataFrame([num.mean(), num.std(ddof=1)], index=['mean', 'sd'])
+
+
 # -----------------------------------------------------------------------------
-# Deployment helpers (task-specific). Same feature layout as training:
+# Deployment helpers. Same feature layout as training:
 # 24 target-time weather rows x 8 features (scaled) + 3 static features (scaled).
 # -----------------------------------------------------------------------------
 def build_next_day_issue_schedule(target_day_weather):
@@ -942,48 +910,69 @@ def build_next_day_issue_schedule(target_day_weather):
     return pd.DataFrame(rows)
 
 
-def build_same_day_issue_schedule(day_weather):
+def build_same_day_issue_schedule(today_weather):
     """
-    Same-day deployment issue schedule on the fixed 15-minute grid.
+    Build the real deployment Same-Day issue schedule from today's 15-minute weather table.
 
-    Required columns: Timestamp, Solar_Zenith_rad. The table must extend at least
-    6 h beyond the last issue time considered. Same rule as training:
-    the issue time must be daylight AND its next 24 targets must contain daylight.
-    Example: sunrise 07:08 -> 07:00 excluded, 07:15 first issue -> 07:30 ... 13:15.
+    Required columns: Timestamp, Solar_Zenith_rad.
+    Same rule as training: first target = first daylight 15-minute grid point,
+    first issue = first target - 15 min, then every 15 min while the first target
+    is daylight. The issue time itself need not be daylight.
+    Example: sunrise 07:08 -> first daylight grid 07:15 -> first issue 07:00
+    (07:15 ... 13:00), then 07:15 (07:30 ... 13:15), 07:30, ...
     """
-    x = day_weather.copy()
+    x = today_weather.copy()
     if 'Timestamp' not in x.columns or 'Solar_Zenith_rad' not in x.columns:
-        raise ValueError('day_weather must contain Timestamp and Solar_Zenith_rad.')
+        raise ValueError('today_weather must contain Timestamp and Solar_Zenith_rad.')
+
     x['Timestamp'] = pd.to_datetime(x['Timestamp'], errors='raise')
     if x['Timestamp'].duplicated().any() or not x['Timestamp'].is_monotonic_increasing:
-        raise ValueError('day_weather timestamps must be unique and increasing.')
+        raise ValueError('today_weather timestamps must be unique and increasing.')
+
     if len(x) > 1:
         dt = x['Timestamp'].diff().dropna().dt.total_seconds().to_numpy() / 60.0
         if not np.all(dt == STEP_MIN):
-            raise ValueError(f'day_weather must be continuous {STEP_MIN}-minute data.')
+            raise ValueError(f'today_weather must be continuous {STEP_MIN}-minute data.')
 
-    daylight = x['Solar_Zenith_rad'].to_numpy(np.float32) < (np.pi / 2)
-    ts = pd.DatetimeIndex(x['Timestamp'])
+    daylight = x['Solar_Zenith_rad'].to_numpy(float) < (np.pi / 2.0)
+    daylight_pos = np.flatnonzero(daylight)
+    if len(daylight_pos) == 0:
+        return pd.DataFrame(columns=[
+            'Issue_Timestamp',
+            'First_Target_Timestamp',
+            'Last_Target_Timestamp',
+        ])
+
+    target_start = pd.Timestamp(x['Timestamp'].iloc[int(daylight_pos[0])])
+    ts_values = x['Timestamp'].to_numpy(dtype='datetime64[ns]')
+
     rows = []
-    for pos in range(0, len(x) - HORIZON):
-        if daylight[pos] and np.any(daylight[pos + 1:pos + 1 + HORIZON]):
-            rows.append({
-                'Issue_Timestamp': ts[pos],
-                'First_Target_Timestamp': ts[pos + 1],
-                'Last_Target_Timestamp': ts[pos + HORIZON],
-            })
-    return pd.DataFrame(rows, columns=['Issue_Timestamp', 'First_Target_Timestamp',
-                                       'Last_Target_Timestamp'])
+    while True:
+        match = np.flatnonzero(ts_values == np.datetime64(target_start))
+        if len(match) == 0:
+            break
+        pos = int(match[0])
+        if not daylight[pos]:
+            break
+
+        rows.append({
+            'Issue_Timestamp': target_start - pd.Timedelta(minutes=STEP_MIN),
+            'First_Target_Timestamp': target_start,
+            'Last_Target_Timestamp': target_start + pd.Timedelta(minutes=(HORIZON - 1) * STEP_MIN),
+        })
+        target_start += pd.Timedelta(minutes=SAME_DAY_CADENCE_STEPS * STEP_MIN)
+
+    return pd.DataFrame(rows)
 
 
-deployment_model = None  # set to the seed-42 model after final training
+deployment_model = None  # seed-42 model of the current task, set after final training
 
 
 def predict_6h(future_weather_24, static_values, rated_power_w):
     """
-    Predict one 24-step 6-hour window with the deployment (seed 42) model.
-    future_weather_24 = the 24 TARGET-time weather rows (t+15 ... t+360 for same-day,
-    next-day t+24h15m ... t+30h for next-day).
+    Predict one 24-step 6-hour window with the deployment (seed 42) model of the task.
+    future_weather_24 = the 24 TARGET-time weather rows (t+15 ... t+360 for Same-Day,
+    t+24h15m ... t+30h for Next-Day).
     """
     if deployment_model is None:
         raise RuntimeError('Deployment model is not loaded.')
@@ -1027,37 +1016,29 @@ predict_next_day_6h = predict_6h
 
 
 def check_deployment_schedule_matches_training(h):
-    """The deployment issue-schedule helper must reproduce the training index (House 11)."""
+    """The deployment issue-schedule helper must reproduce the training schedule (House 11)."""
     d = houses[h]
     ts = pd.DatetimeIndex(d['timestamps'])
-    _, origins = build_task_index([h], FINAL_STRIDE_FOR_TASK)
+    _, origins = build_task_index([h], FINAL_CADENCE)
     issue_ts = ts[origins]
-    # Training issues grouped by the day they belong to (target day for next-day).
-    group_day = (issue_ts + pd.Timedelta(hours=24, minutes=15)).normalize() if TASK == 'next_day' \
-        else issue_ts.normalize()
-    expected_by_day = pd.Series(issue_ts).groupby(group_day).apply(set).to_dict()
+    # Training issues grouped by their target day.
+    target_day = (issue_ts + pd.Timedelta(minutes=(TARGET_OFFSET_STEPS + 1) * STEP_MIN)).normalize()
+    expected_by_day = pd.Series(issue_ts).groupby(target_day).apply(set).to_dict()
     weather = pd.DataFrame({'Timestamp': ts, 'Solar_Zenith_rad': d['future_raw'][:, FUTURE_FEATURES.index('Solar_Zenith_rad')]})
     days = ts.normalize()
-    unique_days = days.unique()
     n_checked = 0
     # Skip the first and last two days of the file (file-edge truncation).
-    for day in unique_days[2:-2]:
+    for day in days.unique()[2:-2]:
         day_pos = np.flatnonzero(days == day)
-        expected = expected_by_day.get(day, set())
+        table = weather.iloc[day_pos[0]:day_pos[-1] + 1]
         if TASK == 'next_day':
-            helper = build_next_day_issue_schedule(weather.iloc[day_pos[0]:day_pos[-1] + 1])
-            helper_issue = set(pd.DatetimeIndex(helper['Issue_Timestamp_Today']))
+            helper_issue = set(pd.DatetimeIndex(build_next_day_issue_schedule(table)['Issue_Timestamp_Today']))
         else:
-            table = weather.iloc[day_pos[0]:day_pos[-1] + 1 + HORIZON]
-            helper = build_same_day_issue_schedule(table)
-            helper_issue = set(pd.DatetimeIndex(helper['Issue_Timestamp']))
-        if helper_issue != expected:
-            raise RuntimeError(f'Deployment issue schedule differs from training index on {day.date()}.')
+            helper_issue = set(pd.DatetimeIndex(build_same_day_issue_schedule(table)['Issue_Timestamp']))
+        if helper_issue != expected_by_day.get(day, set()):
+            raise RuntimeError(f'{TASK}: deployment issue schedule differs from training on {day.date()}.')
         n_checked += 1
-    print(f'Deployment issue-schedule helper matches the training index on {n_checked} House-{h} days.')
-
-
-check_deployment_schedule_matches_training(VAL_HOUSES[0])
+    print(f'{TASK}: deployment issue-schedule helper matches the training schedule on {n_checked} House-{h} days.')
 
 
 def check_deployment_predictions_match_evaluation(meta, eval_pred_pu, n_windows=48):
@@ -1067,7 +1048,7 @@ def check_deployment_predictions_match_evaluation(meta, eval_pred_pu, n_windows=
     for i in idx:
         h = int(meta['house'][i])
         d = houses[h]
-        fidx = meta['origin'][i] + TARGET_OFFSET_STEPS + np.arange(1, HORIZON + 1)
+        fidx = meta['origin'][i] + TARGET_OFFSET_STEPS + FUTURE_OFFSETS
         wx = pd.DataFrame(d['future_raw'][fidx], columns=FUTURE_FEATURES)
         wx.insert(0, 'Timestamp', d['timestamps'][fidx])
         static_values = dict(zip(STATIC_FEATURES, d['static_raw'].tolist()))
@@ -1075,203 +1056,246 @@ def check_deployment_predictions_match_evaluation(meta, eval_pred_pu, n_windows=
         max_diff = max(max_diff, float(np.max(np.abs(out['PV_Predicted_pu'].to_numpy() - eval_pred_pu[i]))))
     if max_diff > 1e-4:
         raise RuntimeError(f'Deployment helper differs from evaluation pipeline (max |diff| = {max_diff:.2e} pu).')
-    print(f'Deployment helper reproduces evaluation outputs on {len(idx)} House-11 windows '
+    print(f'{TASK}: deployment helper reproduces evaluation outputs on {len(idx)} House-11 windows '
           f'(max |diff| = {max_diff:.2e} pu).')
 
 
-# -----------------------------------------------------------------------------
-# Optuna — ONE study for this (architecture, task); House 11 only.
-# -----------------------------------------------------------------------------
-# Resumable Optuna (frozen rule): persistent SQLite storage on Google Drive,
-# one study per (architecture, task). A disconnected Colab run resumes its study.
-OPTUNA_STUDY_NAME = f'{ARCH_KEY}_{TASK}'
-OPTUNA_STORAGE_URL = f"sqlite:///{EXPERIMENT_DIR / 'optuna_studies.db'}"
-study = optuna.create_study(
-    study_name=OPTUNA_STUDY_NAME,
-    storage=OPTUNA_STORAGE_URL,
-    load_if_exists=True,
-    direction='minimize',
-    sampler=optuna.samplers.TPESampler(seed=SEED),
-    pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
-)
-# A trial left RUNNING by a disconnected session never finished: mark it FAIL so it is
-# repeated. Only finished (COMPLETE or PRUNED) trials count towards OPTUNA_TRIALS.
-for stale in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
-    study.tell(stale.number, state=optuna.trial.TrialState.FAIL)
-    print(f'Optuna: interrupted trial {stale.number} marked FAIL and will be repeated.')
-n_finished = len(study.get_trials(
-    deepcopy=False,
-    states=(optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED),
-))
-n_remaining = max(0, OPTUNA_TRIALS - n_finished)
-print(f'Optuna study {OPTUNA_STUDY_NAME!r} ({OPTUNA_STORAGE_URL}): '
-      f'{n_finished} finished trials, {n_remaining} remaining.')
-if n_remaining > 0:
-    study.optimize(objective, n_trials=n_remaining, gc_after_trial=True)
-print('Best params:', study.best_params)
-study.trials_dataframe().to_csv(RUN_DIR / 'optuna_trials.csv', index=False)
-with open(RUN_DIR / 'best_hyperparameters.json', 'w') as f:
-    json.dump(study.best_params, f, indent=2)
-
-best = dict(study.best_params)
-batch = int(best['batch_size'])
-
-# -----------------------------------------------------------------------------
-# Final frozen configuration retrained with seeds 42, 43, 44.
-# Early stopping / ReduceLROnPlateau / checkpoint on House-11 val_loss only.
-# -----------------------------------------------------------------------------
-seed_rows, seed_planning_rows, seed_info = [], [], {}
-for s in FINAL_SEEDS:
-    print(f'\n========== {ARCH_LABEL} | {TASK} | final seed {s} ==========')
-    keras.utils.set_random_seed(s)
-
-    train_seq = MultiHouseSequence(TRAIN_HOUSES, batch, FINAL_STRIDE_FOR_TASK, True)
-    val_seq = MultiHouseSequence(VAL_HOUSES, batch, FINAL_STRIDE_FOR_TASK, False)
-    if schedule_sha256(val_seq.sample_house, val_seq.sample_origin) != VAL_SCHEDULE_SHA256:
-        raise RuntimeError('Validation schedule changed between seeds.')
-    print(f'Train samples: {len(train_seq.sample_origin):,} | Val samples: {len(val_seq.sample_origin):,}')
-
-    model = build_model(best)
-    trainable_params = int(np.sum([np.prod(v.shape) for v in model.trainable_weights]))
-    seed_dir = MODEL_DIR / f'seed_{s}'
-    seed_dir.mkdir(parents=True, exist_ok=True)
-    model_path = seed_dir / f'{ARCH_KEY}_{TASK}_seed{s}.keras'
-    history = model.fit(
-        train_seq, validation_data=val_seq, epochs=FINAL_EPOCHS, verbose=2,
-        callbacks=[
-            keras.callbacks.EarlyStopping(monitor='val_loss', patience=PATIENCE, restore_best_weights=True),
-            keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4, min_lr=1e-6, verbose=1),
-            keras.callbacks.ModelCheckpoint(model_path, monitor='val_loss', save_best_only=True, verbose=0),
-        ],
+def run_optuna_study():
+    """One persistent, resumable Optuna study for (architecture, current task)."""
+    study_name = f'{ARCH_KEY}_{TASK}'
+    storage_url = f"sqlite:///{EXPERIMENT_DIR / 'optuna_studies.db'}"
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_url,
+        load_if_exists=True,
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(seed=SEED),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
     )
-    best_epoch = int(np.argmin(history.history['val_loss']) + 1)
-    pd.DataFrame(history.history).to_csv(seed_dir / 'training_history.csv', index_label='epoch0')
-    model = keras.models.load_model(model_path, custom_objects={'MaskedMSE': MaskedMSE})
+    # A trial left RUNNING by a disconnected session never finished: mark it FAIL so it is
+    # repeated. Only finished (COMPLETE or PRUNED) trials count towards OPTUNA_TRIALS.
+    for stale in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
+        study.tell(stale.number, state=optuna.trial.TrialState.FAIL)
+        print(f'Optuna: interrupted trial {stale.number} marked FAIL and will be repeated.')
+    n_finished = len(study.get_trials(
+        deepcopy=False,
+        states=(optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED),
+    ))
+    n_remaining = max(0, OPTUNA_TRIALS - n_finished)
+    print(f'Optuna study {study_name!r} ({storage_url}): '
+          f'{n_finished} finished trials, {n_remaining} remaining.')
+    if n_remaining > 0:
+        study.optimize(objective, n_trials=n_remaining, gc_after_trial=True)
+    return study, study_name, storage_url
 
-    plt.figure(figsize=(9, 5))
-    plt.plot(history.history['loss'], label='Train')
-    plt.plot(history.history['val_loss'], label='Validation (House 11)')
-    plt.xlabel('Epoch'); plt.ylabel('Masked MSE (per-unit)')
-    plt.title(f'{ARCH_LABEL} — {TASK} — seed {s} — Training / Validation Loss')
-    plt.legend(); plt.grid(alpha=.25); plt.tight_layout()
-    plt.savefig(seed_dir / 'training_validation_loss.png', dpi=160); plt.show(); plt.close('all')
 
-    meta = val_seq.collect_meta()
-    raw_pred_pu = model.predict(val_seq, verbose=0).astype(np.float32)
-    raw_val_mse = float(np.sum(((raw_pred_pu - meta['y_pu']) ** 2) * meta['mask']) / np.sum(meta['mask']))
-    res = evaluate_predictions(meta, raw_pred_pu, 'Validation_House_11')
+def save_optuna_outputs(study):
+    study.trials_dataframe().to_csv(RUN_DIR / 'optuna_trials.csv', index=False)
+    with open(RUN_DIR / 'best_hyperparameters.json', 'w') as f:
+        json.dump(study.best_params, f, indent=2)
+    try:
+        ax = optuna.visualization.matplotlib.plot_optimization_history(study)
+        ax.figure.tight_layout(); ax.figure.savefig(RUN_DIR / 'optuna_history.png', dpi=160); plt.show()
+    except Exception as e:
+        print('Could not create Optuna history plot:', e)
+    try:
+        ax = optuna.visualization.matplotlib.plot_param_importances(study)
+        ax.figure.tight_layout(); ax.figure.savefig(RUN_DIR / 'optuna_parameter_importance.png', dpi=160); plt.show()
+    except Exception as e:
+        print('Could not create Optuna parameter-importance plot:', e)
+    plt.close('all')
 
-    row = dict(res['overall']); row['Seed'] = s; seed_rows.append(row)
-    prow = dict(res['planning_overall']); prow['Seed'] = s; seed_planning_rows.append(prow)
-    res['by_horizon'].to_csv(seed_dir / 'validation_metrics_by_horizon.csv', index=False)
-    res['window_metrics'].to_csv(seed_dir / 'validation_window_planning_metrics.csv.gz', index=False)
-    np.savez_compressed(
-        seed_dir / 'house11_predictions.npz',
-        house=meta['house'], origin=meta['origin'],
-        raw_pred_pu=raw_pred_pu, pred_pu=res['pred_pu'],
-        y_pu=meta['y_pu'], mask=meta['mask'],
-    )
-    seed_info[s] = {
-        'model_file': str(model_path.relative_to(RUN_DIR)),
-        'best_epoch': best_epoch,
-        'raw_masked_val_mse_pu': raw_val_mse,
-        'house11_nRMSE_percent': float(res['overall']['nRMSE_percent']),
-        'trainable_parameters': trainable_params,
+
+def write_house11_tables(seed_rows, seed_planning_rows):
+    per_seed_df = pd.DataFrame(seed_rows)
+    pd.DataFrame(seed_rows).to_csv(RUN_DIR / 'house11_point_metrics_per_seed.csv', index=False)
+    pd.DataFrame(seed_planning_rows).to_csv(RUN_DIR / 'house11_planning_metrics_per_seed.csv', index=False)
+    mean_sd_table(seed_rows).to_csv(RUN_DIR / 'house11_point_metrics_mean_sd.csv')
+    mean_sd_table(seed_planning_rows).to_csv(RUN_DIR / 'house11_planning_metrics_mean_sd.csv')
+    print(f'\nHOUSE 11 — {ARCH_LABEL} — {TASK} — per seed'); display(per_seed_df)
+    print('\nHOUSE 11 — mean ± SD over seeds'); display(mean_sd_table(seed_rows))
+
+
+def write_summary(study, study_name, storage_url, best, seed_info, val_schedule_sha256, n_val_windows, extra):
+    nrmse_seeds = [seed_info[s]['house11_nRMSE_percent'] for s in FINAL_SEEDS]
+    summary = {
+        'phase': 1,
+        'architecture': ARCH_KEY,
+        'architecture_label': ARCH_LABEL,
+        'task': TASK,
+        'completed_utc': datetime.now(timezone.utc).isoformat(),
+        'train_houses': TRAIN_HOUSES, 'validation_house': VAL_HOUSES,
+        'houses_loaded': PRETEST_HOUSES,
+        'test_houses_accessed': False,
+        'house_file_sha256': {str(h): v for h, v in house_file_sha256.items()},
+        'future_scaler': {'mean': future_scaler.mean_.tolist(), 'scale': future_scaler.scale_.tolist()},
+        'static_scaler': {'mean': static_scaler.mean_.tolist(), 'scale': static_scaler.scale_.tolist()},
+        'schedule': (
+            f'first target of each target day = its first 15-min daylight grid point; '
+            f'first issue = first target - {TARGET_OFFSET_STEPS} - 1 steps; '
+            f'issues every {FINAL_CADENCE} step(s) while the first target is daylight; '
+            f'targets = origin + {TARGET_OFFSET_STEPS} + (1..24); '
+            f'Optuna cadence {TUNE_CADENCE} step(s); final fit/evaluation cadence {FINAL_CADENCE} step(s)'
+        ),
+        'target_offset_steps': TARGET_OFFSET_STEPS,
+        'operational_cadence_steps': FINAL_CADENCE,
+        'optuna_cadence_steps': TUNE_CADENCE,
+        'house11_validation_schedule_sha256': val_schedule_sha256,
+        'house11_validation_windows': int(n_val_windows),
+        'future_features': FUTURE_FEATURES, 'static_features': STATIC_FEATURES,
+        'target': TARGET, 'target_normalization': 'PV / Array_Rated_Power_W',
+        'optuna_trials': OPTUNA_TRIALS,
+        'optuna_study_name': study_name,
+        'optuna_storage': storage_url,
+        'best_hyperparameters': best,
+        'optuna_best_value': float(study.best_value),
+        'final_seeds': FINAL_SEEDS,
+        'deployment_seed': DEPLOYMENT_SEED,
+        'per_seed': {str(s): v for s, v in seed_info.items()},
+        'house11_nRMSE_percent_mean': float(np.mean(nrmse_seeds)),
+        'house11_nRMSE_percent_sd': float(np.std(nrmse_seeds, ddof=1)),
+        'selection_metric_note': 'nRMSE_percent on post-processed House-11 predictions (clip >= 0, night = 0)',
+        'primary_point_metrics': ['RMSE_W', 'MAE_W', 'nRMSE_percent', 'WAPE_percent', 'R2'],
+        'secondary_point_metrics': ['sMAPE_percent'],
+        'supplementary_point_metrics': ['MAPE_1pct_percent', 'N_MAPE_1pct_included', 'N_MAPE_1pct_excluded'],
+        'pv_lookback_used': False, 'predicted_pv_feedback_used': False, 'past_weather_used': False,
+        'house_id_used_as_feature': False, 'ac_inverter_features_used': False,
+        'night_targets_masked': True,
+        **extra,
     }
+    with open(RUN_DIR / 'phase1_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f'\nPHASE 1 TASK DONE — {ARCH_LABEL} — {TASK}')
+    print(f"House-11 nRMSE (mean ± SD over seeds): {summary['house11_nRMSE_percent_mean']:.4f} ± "
+          f"{summary['house11_nRMSE_percent_sd']:.4f} %")
 
-    if s == DEPLOYMENT_SEED:
-        deployment_model = model
-        check_deployment_predictions_match_evaluation(meta, res['pred_pu'])
-    else:
-        del model
-    del train_seq, val_seq
+
+def prepare_task_run():
+    """Per-task outputs, schedule audit and schedule-helper check (before any training)."""
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(future_scaler, RUN_DIR / 'future_weather_scaler.joblib')
+    joblib.dump(static_scaler, RUN_DIR / 'static_scaler.joblib')
+    audit = build_schedule_audit(PRETEST_HOUSES, FINAL_CADENCE)
+    audit.to_csv(RUN_DIR / 'operational_schedule_audit_houses_01_11.csv.gz', index=False)
+    print(f'{TASK}: schedule audit (Houses 1-11): {len(audit):,} windows')
+    print(audit[audit['House'] == VAL_HOUSES[0]].head(6).to_string(index=False))
+    val_house, val_origin = build_task_index(VAL_HOUSES, FINAL_CADENCE)
+    check_deployment_schedule_matches_training(VAL_HOUSES[0])
+    return schedule_sha256(val_house, val_origin), len(val_origin)
+
+
+def run_task():
+    """Complete Phase-1 pipeline for the CURRENT task (TASK and task globals set by the loop)."""
+    global deployment_model
+    val_schedule_sha256, n_val_windows = prepare_task_run()
+
+    study, study_name, storage_url = run_optuna_study()
+    save_optuna_outputs(study)
+    best = dict(study.best_params)
+    batch = int(best['batch_size'])
+    print(f'{TASK}: best params:', best)
+
+    # Final frozen configuration retrained with seeds 42, 43, 44.
+    # Early stopping / ReduceLROnPlateau / checkpoint on House-11 val_loss only.
+    seed_rows, seed_planning_rows, seed_info = [], [], {}
+    for s in FINAL_SEEDS:
+        print(f'\n========== {ARCH_LABEL} | {TASK} | final seed {s} ==========')
+        keras.utils.set_random_seed(s)
+
+        train_seq = MultiHouseSequence(TRAIN_HOUSES, batch, FINAL_CADENCE, True)
+        val_seq = MultiHouseSequence(VAL_HOUSES, batch, FINAL_CADENCE, False)
+        if schedule_sha256(val_seq.sample_house, val_seq.sample_origin) != val_schedule_sha256:
+            raise RuntimeError('Validation schedule changed between seeds.')
+        print(f'Train samples: {len(train_seq.sample_origin):,} | Val samples: {len(val_seq.sample_origin):,}')
+
+        model = build_model(best)
+        trainable_params = int(np.sum([np.prod(v.shape) for v in model.trainable_weights]))
+        seed_dir = MODEL_DIR / f'seed_{s}'
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        model_path = seed_dir / f'{ARCH_KEY}_{TASK}_seed{s}.keras'
+        history = model.fit(
+            train_seq, validation_data=val_seq, epochs=FINAL_EPOCHS, verbose=2,
+            callbacks=[
+                keras.callbacks.EarlyStopping(monitor='val_loss', patience=PATIENCE, restore_best_weights=True),
+                keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4, min_lr=1e-6, verbose=1),
+                keras.callbacks.ModelCheckpoint(model_path, monitor='val_loss', save_best_only=True, verbose=0),
+            ],
+        )
+        best_epoch = int(np.argmin(history.history['val_loss']) + 1)
+        pd.DataFrame(history.history).to_csv(seed_dir / 'training_history.csv', index_label='epoch0')
+        model = keras.models.load_model(model_path, custom_objects={'MaskedMSE': MaskedMSE})
+
+        plt.figure(figsize=(9, 5))
+        plt.plot(history.history['loss'], label='Train')
+        plt.plot(history.history['val_loss'], label='Validation (House 11)')
+        plt.xlabel('Epoch'); plt.ylabel('Masked MSE (per-unit)')
+        plt.title(f'{ARCH_LABEL} — {TASK} — seed {s} — Training / Validation Loss')
+        plt.legend(); plt.grid(alpha=.25); plt.tight_layout()
+        plt.savefig(seed_dir / 'training_validation_loss.png', dpi=160); plt.show(); plt.close('all')
+
+        meta = val_seq.collect_meta()
+        raw_pred_pu = model.predict(val_seq, verbose=0).astype(np.float32)
+        raw_val_mse = float(np.sum(((raw_pred_pu - meta['y_pu']) ** 2) * meta['mask']) / np.sum(meta['mask']))
+        res = evaluate_predictions(meta, raw_pred_pu, 'Validation_House_11')
+
+        row = dict(res['overall']); row['Seed'] = s; seed_rows.append(row)
+        prow = dict(res['planning_overall']); prow['Seed'] = s; seed_planning_rows.append(prow)
+        res['by_horizon'].to_csv(seed_dir / 'validation_metrics_by_horizon.csv', index=False)
+        res['window_metrics'].to_csv(seed_dir / 'validation_window_planning_metrics.csv.gz', index=False)
+        np.savez_compressed(
+            seed_dir / 'house11_predictions.npz',
+            house=meta['house'], origin=meta['origin'],
+            raw_pred_pu=raw_pred_pu, pred_pu=res['pred_pu'],
+            y_pu=meta['y_pu'], mask=meta['mask'],
+        )
+        seed_info[s] = {
+            'model_file': str(model_path.relative_to(RUN_DIR)),
+            'best_epoch': best_epoch,
+            'raw_masked_val_mse_pu': raw_val_mse,
+            'house11_nRMSE_percent': float(res['overall']['nRMSE_percent']),
+            'trainable_parameters': trainable_params,
+        }
+
+        if s == DEPLOYMENT_SEED:
+            deployment_model = model
+            check_deployment_predictions_match_evaluation(meta, res['pred_pu'])
+        else:
+            del model
+        del train_seq, val_seq
+        gc.collect()
+
+    write_house11_tables(seed_rows, seed_planning_rows)
+    # Deployment model = predefined seed 42, reloaded from disk.
+    deployment_model = keras.models.load_model(
+        MODEL_DIR / f'seed_{DEPLOYMENT_SEED}' / f'{ARCH_KEY}_{TASK}_seed{DEPLOYMENT_SEED}.keras',
+        custom_objects={'MaskedMSE': MaskedMSE},
+    )
+    write_summary(study, study_name, storage_url, best, seed_info, val_schedule_sha256, n_val_windows,
+                  {'feature_layout': 'future_weather (24, 8) + static (3,)'})
+
+
+# =============================================================================
+# MAIN — one execution performs SAME-DAY and then NEXT-DAY automatically.
+# =============================================================================
+for TASK in TASKS:
+    # Task globals read by the functions above.
+    TARGET_OFFSET_STEPS = TASK_TARGET_OFFSET_STEPS[TASK]
+    FINAL_CADENCE = TASK_OPERATIONAL_CADENCE_STEPS[TASK]
+    TUNE_CADENCE = TASK_TUNING_CADENCE_STEPS[TASK]
+    RUN_DIR = PHASE1_DIR / f'{ARCH_KEY}_{TASK}'
+    MODEL_DIR = RUN_DIR / 'models'
+
+    print('\n' + '#' * 79)
+    print(f'# {ARCH_LABEL} — {TASK.upper()} — offset {TARGET_OFFSET_STEPS} steps, '
+          f'cadence {FINAL_CADENCE * STEP_MIN} min (Optuna {TUNE_CADENCE * STEP_MIN} min)')
+    print('#' * 79)
+    if (RUN_DIR / 'phase1_summary.json').exists() and not OVERWRITE_PHASE1_RUN:
+        print(f'{RUN_DIR} already holds a completed {TASK} run — skipped (resume). '
+              'Set OVERWRITE_PHASE1_RUN = True only to deliberately redo it.')
+        continue
+    run_task()
     gc.collect()
 
-# -----------------------------------------------------------------------------
-# House-11 summary: per seed and mean ± SD (sample SD, ddof=1) over seeds 42-44.
-# -----------------------------------------------------------------------------
-def mean_sd_table(rows):
-    df = pd.DataFrame(rows)
-    num = df.drop(columns=[c for c in ('Seed', 'Split') if c in df.columns]).astype(float)
-    return pd.DataFrame([num.mean(), num.std(ddof=1)], index=['mean', 'sd'])
-
-
-per_seed_df = pd.DataFrame(seed_rows)
-planning_seed_df = pd.DataFrame(seed_planning_rows)
-per_seed_df.to_csv(RUN_DIR / 'house11_point_metrics_per_seed.csv', index=False)
-planning_seed_df.to_csv(RUN_DIR / 'house11_planning_metrics_per_seed.csv', index=False)
-mean_sd_table(seed_rows).to_csv(RUN_DIR / 'house11_point_metrics_mean_sd.csv')
-mean_sd_table(seed_planning_rows).to_csv(RUN_DIR / 'house11_planning_metrics_mean_sd.csv')
-print(f'\nHOUSE 11 — {ARCH_LABEL} — {TASK} — per seed'); display(per_seed_df)
-print('\nHOUSE 11 — mean ± SD over seeds'); display(mean_sd_table(seed_rows))
-
-try:
-    ax = optuna.visualization.matplotlib.plot_optimization_history(study)
-    ax.figure.tight_layout(); ax.figure.savefig(RUN_DIR / 'optuna_history.png', dpi=160); plt.show()
-except Exception as e:
-    print('Could not create Optuna history plot:', e)
-try:
-    ax = optuna.visualization.matplotlib.plot_param_importances(study)
-    ax.figure.tight_layout(); ax.figure.savefig(RUN_DIR / 'optuna_parameter_importance.png', dpi=160); plt.show()
-except Exception as e:
-    print('Could not create Optuna parameter-importance plot:', e)
-plt.close('all')
-
-# Deployment model = predefined seed 42, reloaded from disk.
-deployment_model = keras.models.load_model(
-    MODEL_DIR / f'seed_{DEPLOYMENT_SEED}' / f'{ARCH_KEY}_{TASK}_seed{DEPLOYMENT_SEED}.keras',
-    custom_objects={'MaskedMSE': MaskedMSE},
-)
-
-nrmse_seeds =[seed_info[s]['house11_nRMSE_percent'] for s in FINAL_SEEDS]
-summary = {
-    'phase': 1,
-    'architecture': ARCH_KEY,
-    'architecture_label': ARCH_LABEL,
-    'task': TASK,
-    'completed_utc': datetime.now(timezone.utc).isoformat(),
-    'train_houses': TRAIN_HOUSES, 'validation_house': VAL_HOUSES,
-    'houses_loaded': PRETEST_HOUSES,
-    'test_houses_accessed': False,
-    'house_file_sha256': {str(h): v for h, v in house_file_sha256.items()},
-    'future_scaler': {'mean': future_scaler.mean_.tolist(), 'scale': future_scaler.scale_.tolist()},
-    'static_scaler': {'mean': static_scaler.mean_.tolist(), 'scale': static_scaler.scale_.tolist()},
-    'schedule': (
-        'same_day: origin_is_daylight & future_has_daylight; targets origin+1..origin+24; '
-        f'Optuna stride {TUNING_STRIDE}, final stride {FINAL_STRIDE}'
-        if TASK == 'same_day' else
-        'next_day: first target = first 15-min daylight grid of target day; '
-        'issue = first target - 96 - 1 steps; every 8 steps (2 h) while first target is daylight; '
-        'targets origin+96+1..origin+96+24; same schedule for Optuna, final fit, validation'
-    ),
-    'target_offset_steps': TARGET_OFFSET_STEPS,
-    'house11_validation_schedule_sha256': VAL_SCHEDULE_SHA256,
-    'house11_validation_windows': int(len(val_final_origin)),
-    'future_features': FUTURE_FEATURES, 'static_features': STATIC_FEATURES,
-    'feature_layout': 'future_weather (24, 8) + static (3,)',
-    'target': TARGET, 'target_normalization': 'PV / Array_Rated_Power_W',
-    'optuna_trials': OPTUNA_TRIALS,
-    'optuna_study_name': OPTUNA_STUDY_NAME,
-    'optuna_storage': OPTUNA_STORAGE_URL,
-    'optuna_objective': 'House-11 daylight-masked MSE of the raw per-unit output (neural val_loss, no clipping)',
-    'best_hyperparameters': best,
-    'optuna_best_value': float(study.best_value),
-    'final_seeds': FINAL_SEEDS,
-    'deployment_seed': DEPLOYMENT_SEED,
-    'per_seed': {str(s): v for s, v in seed_info.items()},
-    'house11_nRMSE_percent_mean': float(np.mean(nrmse_seeds)),
-    'house11_nRMSE_percent_sd': float(np.std(nrmse_seeds, ddof=1)),
-    'selection_metric_note': 'nRMSE_percent on post-processed House-11 predictions (clip >= 0, night = 0)',
-    'primary_point_metrics': ['RMSE_W', 'MAE_W', 'nRMSE_percent', 'WAPE_percent', 'R2'],
-    'secondary_point_metrics': ['sMAPE_percent'],
-    'supplementary_point_metrics': ['MAPE_1pct_percent', 'N_MAPE_1pct_included', 'N_MAPE_1pct_excluded'],
-    'pv_lookback_used': False, 'predicted_pv_feedback_used': False, 'past_weather_used': False,
-    'house_id_used_as_feature': False, 'ac_inverter_features_used': False,
-    'night_targets_masked': True,
-}
-with open(RUN_DIR / 'phase1_summary.json', 'w') as f:
-    json.dump(summary, f, indent=2)
-print(f'\nPHASE 1 DONE — {ARCH_LABEL} — {TASK}')
-print(f"House-11 nRMSE (mean ± SD over seeds): {summary['house11_nRMSE_percent_mean']:.4f} ± "
-      f"{summary['house11_nRMSE_percent_sd']:.4f} %")
-print('Outputs:', RUN_DIR)
+print(f'\nPHASE 1 DONE — {ARCH_LABEL} — same_day and next_day')
+print('Outputs:', [str(PHASE1_DIR / f'{ARCH_KEY}_{t}') for t in TASKS])

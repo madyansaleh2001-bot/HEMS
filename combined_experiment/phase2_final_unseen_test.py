@@ -11,6 +11,11 @@
 # The architecture selected on House 11 stays the selected architecture whatever the
 # test results show.
 #
+# Schedules (identical to Phase 1): first target of each day = first 15-min daylight
+# grid point; first issue = first target - offset - 15 min; then every cadence while the
+# first target is daylight. Same-Day: offset 0, every 15 min, targets issue+15..issue+360.
+# Next-Day: offset 24 h, every 2 h, targets issue+24h15..issue+30h.
+#
 # Consistency checks before any test metric is computed:
 #   - Phase-1 summaries are unchanged since selection (SHA-256).
 #   - House 1-11 data files are unchanged (SHA-256 of House 11 re-checked).
@@ -68,9 +73,12 @@ STEPS_PER_DAY = (24 * 60) // STEP_MIN  # 96
 DAY_AHEAD_OFFSET_STEPS = STEPS_PER_DAY
 DEPLOYMENT_UPDATE_HOURS = 2
 DEPLOYMENT_CADENCE_STEPS = (DEPLOYMENT_UPDATE_HOURS * 60) // STEP_MIN  # 8
-FINAL_STRIDE = 1    # same-day evaluation: every 15 min
+FUTURE_OFFSETS = np.arange(1, HORIZON + 1, dtype=np.int32)   # 1 ... 24
+SAME_DAY_CADENCE_STEPS = 1                                    # every 15 min
 MAPE_THRESHOLD_PU = 0.01
+# Same schedule rule as Phase 1: offset 0 / 1 day; cadence 15 min / 2 h.
 TARGET_OFFSET_STEPS_BY_TASK = {'same_day': 0, 'next_day': DAY_AHEAD_OFFSET_STEPS}
+OPERATIONAL_CADENCE_STEPS_BY_TASK = {'same_day': SAME_DAY_CADENCE_STEPS, 'next_day': DEPLOYMENT_CADENCE_STEPS}
 
 FUTURE_FEATURES = [
     'Temperature', 'Relative Humidity', 'GHI', 'DNI', 'DHI', 'Wind Speed',
@@ -171,39 +179,31 @@ def load_house(h, path):
     }
 
 
-def build_index(house_ids, stride):
-    hs, origins_all = [], []
-    future_offsets = np.arange(1, HORIZON + 1, dtype=np.int32)
-    for h in house_ids:
-        d = houses[h]
-        # Same-day forecast origins. Final stride=1 means every 15 minutes.
-        origins = np.arange(0, len(d['pv_pu']) - HORIZON, stride, dtype=np.int32)
-        future_idx = origins[:, None] + future_offsets[None, :]
-
-        # Keep the original same-day sunrise/sunset rule:
-        # the issue time itself must be daylight, and the future 6-hour
-        # window must contain at least one daylight target.
-        # Example: sunrise 07:08 -> 07:00 excluded, 07:15 included.
-        origin_is_daylight = d['daylight'][origins]
-        future_has_daylight = np.any(d['daylight'][future_idx], axis=1)
-        origins = origins[origin_is_daylight & future_has_daylight]
-
-        hs.append(np.full(len(origins), h, np.int16))
-        origins_all.append(origins)
-
-    if not origins_all:
-        return np.empty(0, np.int16), np.empty(0, np.int32)
-    return np.concatenate(hs), np.concatenate(origins_all)
-
-
 _OPERATIONAL_ORIGIN_CACHE = {}
 
 
-def operational_origins_for_house(h):
-    """Return cached exact operational origins for one house."""
-    h = int(h)
-    if h in _OPERATIONAL_ORIGIN_CACHE:
-        return _OPERATIONAL_ORIGIN_CACHE[h]
+def operational_origins_for_house(h, offset_steps, cadence_steps):
+    """
+    Exact operational issue indices (origins) for one house.
+
+    For every target day:
+      first target = first 15-minute daylight grid point of that day;
+      first issue  = first target - offset_steps - 1 step;
+      then one issue every cadence_steps while the window's FIRST target is
+      still daylight on that same target day. The issue itself need not be daylight.
+    Targets of an issue = origin + offset_steps + FUTURE_OFFSETS (1..24).
+
+    Same-Day: offset_steps = 0,  cadence_steps = 1 (15 min).
+      sunrise 07:08 -> first target 07:15 -> issue 07:00 -> 07:15 ... 13:00,
+      issue 07:15 -> 07:30 ... 13:15, ...
+    Next-Day: offset_steps = 96, cadence_steps = 8 (2 h).
+      tomorrow sunrise 07:08 -> first target 07:15 -> issue today 07:00 ->
+      tomorrow 07:15 ... 13:00, issue 09:00 -> 09:15 ... 15:00, ...
+    """
+    key = (int(h), int(offset_steps), int(cadence_steps))
+    if key in _OPERATIONAL_ORIGIN_CACHE:
+        return _OPERATIONAL_ORIGIN_CACHE[key]
+    h, offset_steps, cadence_steps = key
 
     d = houses[h]
     ts = pd.DatetimeIndex(d['timestamps'])
@@ -216,12 +216,10 @@ def operational_origins_for_house(h):
         return_counts=True,
     )
 
+    first_target_delta = pd.Timedelta(minutes=(offset_steps + 1) * STEP_MIN)
     house_origins = []
 
-    # The first target date has no previous-day issue inside the file.
-    for target_date64, day_start, day_count in zip(
-        unique_dates[1:], day_starts[1:], day_counts[1:]
-    ):
+    for target_date64, day_start, day_count in zip(unique_dates, day_starts, day_counts):
         day_idx = np.arange(
             int(day_start),
             int(day_start + day_count),
@@ -231,26 +229,26 @@ def operational_origins_for_house(h):
         if len(daylight_idx) == 0:
             continue
 
-        # First prediction = first 15-minute daylight timestamp of target day.
+        # First prediction = first 15-minute daylight timestamp of the target day.
         first_target_idx = int(daylight_idx[0])
 
-        # target = issue + 24h + 15min, therefore:
-        # issue = first_target - 96 steps - 1 step.
-        first_origin = first_target_idx - DAY_AHEAD_OFFSET_STEPS - 1
+        # first target = issue + offset + 15 min, therefore:
+        # issue = first target - offset steps - 1 step.
+        first_origin = first_target_idx - offset_steps - 1
         if first_origin < 0:
+            # e.g. the first target day of the file for Next-Day: no issue inside the file.
             continue
 
         k = 0
         while True:
-            origin = first_origin + k * DEPLOYMENT_CADENCE_STEPS
-            reference_idx = origin + DAY_AHEAD_OFFSET_STEPS
-            first_pred_idx = reference_idx + 1
-            last_pred_idx = reference_idx + HORIZON
+            origin = first_origin + k * cadence_steps
+            first_pred_idx = origin + offset_steps + 1
+            last_pred_idx = origin + offset_steps + HORIZON
 
             if last_pred_idx >= len(ts):
                 break
 
-            # Stop if the later 2-hour slot moved into another target day.
+            # Stop if the later slot moved into another target day.
             if normalized_dates[first_pred_idx] != target_date64:
                 break
 
@@ -259,17 +257,16 @@ def operational_origins_for_house(h):
                 break
 
             issue_ts = ts[origin]
-            reference_ts = ts[reference_idx]
             first_target_ts = ts[first_pred_idx]
 
             # Hard timing checks.
-            if reference_ts - issue_ts != pd.Timedelta(hours=24):
+            if first_target_ts - issue_ts != first_target_delta:
+                raise RuntimeError(
+                    f'House {h:02d}: first target is not issue + {first_target_delta} at {issue_ts}.'
+                )
+            if offset_steps == DAY_AHEAD_OFFSET_STEPS and ts[origin + offset_steps] - issue_ts != pd.Timedelta(hours=24):
                 raise RuntimeError(
                     f'House {h:02d}: next-day reference is not exactly +24 h at {issue_ts}.'
-                )
-            if first_target_ts - issue_ts != pd.Timedelta(hours=24, minutes=15):
-                raise RuntimeError(
-                    f'House {h:02d}: first target is not exactly +24 h 15 min at {issue_ts}.'
                 )
 
             # The first operational window of each target day MUST start
@@ -283,26 +280,8 @@ def operational_origins_for_house(h):
             k += 1
 
     out = np.asarray(house_origins, dtype=np.int32)
-    _OPERATIONAL_ORIGIN_CACHE[h] = out
+    _OPERATIONAL_ORIGIN_CACHE[key] = out
     return out
-
-
-def build_operational_index(house_ids):
-    """Exact next-day schedule used everywhere in this experiment."""
-    hs = []
-    origins_all = []
-
-    for h in house_ids:
-        origins = operational_origins_for_house(int(h))
-        if len(origins) == 0:
-            continue
-        hs.append(np.full(len(origins), int(h), dtype=np.int16))
-        origins_all.append(origins)
-
-    if not origins_all:
-        return np.empty(0, np.int16), np.empty(0, np.int32)
-
-    return np.concatenate(hs), np.concatenate(origins_all)
 
 
 def schedule_sha256(sample_house, sample_origin):
@@ -574,10 +553,18 @@ for h in TEST_HOUSES:
 
 
 def build_task_index(task, house_ids):
-    """Same-day: reference build_index(FINAL_STRIDE). Next-day: operational schedule."""
-    if task == 'same_day':
-        return build_index(house_ids, FINAL_STRIDE)
-    return build_operational_index(house_ids)
+    """Operational schedule of `task` (Phase-1 rule, full operational cadence)."""
+    hs, origins_all = [], []
+    for h in house_ids:
+        origins = operational_origins_for_house(
+            int(h), TARGET_OFFSET_STEPS_BY_TASK[task], OPERATIONAL_CADENCE_STEPS_BY_TASK[task])
+        if len(origins) == 0:
+            continue
+        hs.append(np.full(len(origins), int(h), dtype=np.int16))
+        origins_all.append(origins)
+    if not origins_all:
+        return np.empty(0, np.int16), np.empty(0, np.int32)
+    return np.concatenate(hs), np.concatenate(origins_all)
 
 
 def build_arrays(task, house_ids):
@@ -592,7 +579,7 @@ def build_arrays(task, house_ids):
     rated = np.empty(n, np.float32)
     origin_ts = np.empty(n, dtype='datetime64[ns]')
     target_start_ts = np.empty(n, dtype='datetime64[ns]')
-    offsets = np.arange(1, HORIZON + 1, dtype=np.int32)
+    offsets = FUTURE_OFFSETS
     for h in np.unique(sample_house):
         pos = np.flatnonzero(sample_house == h)
         origins = sample_origin[pos]
@@ -845,7 +832,7 @@ deployment = {
     'models': {},
     'future_features': FUTURE_FEATURES, 'static_features': STATIC_FEATURES,
     'grid': '15-minute grid; daylight = Solar_Zenith_rad < pi/2; predictions clipped >= 0 and 0 at night',
-    'same_day_schedule': 'issue every 15 min while the issue time is daylight and its next 24 targets contain daylight; targets t+15 ... t+360',
+    'same_day_schedule': 'first target = first daylight 15-min grid point of today; first issue = that - 15 min; then every 15 min while the first target is daylight; targets t+15 ... t+360',
     'next_day_schedule': 'first target = first daylight 15-min grid point of tomorrow; issue = that - 24 h - 15 min; then every 2 h while the first target is daylight; targets t+24h15m ... t+30h',
     'zenith_convention_note': 'Before Raspberry Pi deployment verify timestamp semantics, time zone, true vs apparent zenith and instantaneous vs interval representation against the training datasets.',
 }
