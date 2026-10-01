@@ -989,11 +989,31 @@ def check_deployment_predictions_match_evaluation(meta, eval_pred_pu, n_windows=
 # -----------------------------------------------------------------------------
 # Optuna — ONE study for this (XGBoost, task); House 11 only.
 # -----------------------------------------------------------------------------
+# Resumable Optuna (frozen rule): persistent SQLite storage on Google Drive,
+# one study per (architecture, task). A disconnected Colab run resumes its study.
+OPTUNA_STUDY_NAME = f'{ARCH_KEY}_{TASK}'
+OPTUNA_STORAGE_URL = f"sqlite:///{EXPERIMENT_DIR / 'optuna_studies.db'}"
 study = optuna.create_study(
+    study_name=OPTUNA_STUDY_NAME,
+    storage=OPTUNA_STORAGE_URL,
+    load_if_exists=True,
     direction='minimize',
     sampler=optuna.samplers.TPESampler(seed=SEED),
 )
-study.optimize(objective, n_trials=OPTUNA_TRIALS, gc_after_trial=True)
+# A trial left RUNNING by a disconnected session never finished: mark it FAIL so it is
+# repeated. Only finished (COMPLETE or PRUNED) trials count towards OPTUNA_TRIALS.
+for stale in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
+    study.tell(stale.number, state=optuna.trial.TrialState.FAIL)
+    print(f'Optuna: interrupted trial {stale.number} marked FAIL and will be repeated.')
+n_finished = len(study.get_trials(
+    deepcopy=False,
+    states=(optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED),
+))
+n_remaining = max(0, OPTUNA_TRIALS - n_finished)
+print(f'Optuna study {OPTUNA_STUDY_NAME!r} ({OPTUNA_STORAGE_URL}): '
+      f'{n_finished} finished trials, {n_remaining} remaining.')
+if n_remaining > 0:
+    study.optimize(objective, n_trials=n_remaining, gc_after_trial=True)
 print('Best params:', study.best_params)
 study.trials_dataframe().to_csv(RUN_DIR / 'optuna_trials.csv', index=False)
 with open(RUN_DIR / 'best_hyperparameters.json', 'w') as f:
@@ -1138,6 +1158,8 @@ summary = {
     'xgboost_device': XGB_DEVICE,
     'xgboost_models_per_seed': HORIZON,
     'optuna_trials': OPTUNA_TRIALS,
+    'optuna_study_name': OPTUNA_STUDY_NAME,
+    'optuna_storage': OPTUNA_STORAGE_URL,
     'optuna_tuning_horizons_steps': [j + 1 for j in TUNE_HORIZONS],
     'optuna_objective': 'House-11 daylight-masked MSE (per-unit) of raw predictions, pooled over all daylight points of all 24 horizons (same quantity as neural val_loss)',
     'best_hyperparameters': best,

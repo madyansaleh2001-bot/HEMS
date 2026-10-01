@@ -537,12 +537,12 @@ class MaskedMSE(tf.keras.losses.Loss):
 
 
 # >>> ARCHITECTURE MODEL AND SEARCH SPACE (architecture-specific) >>>
-# CNN: the Next-Day LSTM-CNN reference encoder with the LSTM layer removed
-# (Conv1D 'same' padding -> Flatten), same fusion head; Optuna ranges = LSTM-CNN
-# ranges without future_units.
+# Validated CNN reference: Conv1D(conv_filters_1) -> Conv1D(conv_filters_2) -> Flatten
+# -> Dropout, with the same static branch and fusion head as the other networks.
 def suggest_params(trial):
     return {
-        'conv_filters': trial.suggest_categorical('conv_filters', [16, 32, 64]),
+        'conv_filters_1': trial.suggest_categorical('conv_filters_1', [16, 32, 64]),
+        'conv_filters_2': trial.suggest_categorical('conv_filters_2', [16, 32, 64, 128]),
         'kernel_size': trial.suggest_categorical('kernel_size', [2, 3, 5]),
         'dense_units': trial.suggest_categorical('dense_units', [64, 128, 192, 256]),
         'dropout': trial.suggest_float('dropout', 0.0, 0.4, step=0.1),
@@ -553,13 +553,15 @@ def suggest_params(trial):
 
 def build_model(params):
     tf.keras.backend.clear_session()
-    conv_filters = int(params['conv_filters'])
+    conv_filters_1 = int(params['conv_filters_1'])
+    conv_filters_2 = int(params['conv_filters_2'])
     kernel_size = int(params['kernel_size'])
     dense_units = int(params['dense_units'])
     dropout = float(params['dropout'])
 
     future_in = keras.Input((HORIZON, len(FUTURE_FEATURES)), name='future_weather')
-    b = layers.Conv1D(conv_filters, kernel_size, padding='same', activation='relu', name='future_weather_conv1d')(future_in)
+    b = layers.Conv1D(conv_filters_1, kernel_size, padding='same', activation='relu', name='future_weather_conv1d_1')(future_in)
+    b = layers.Conv1D(conv_filters_2, kernel_size, padding='same', activation='relu', name='future_weather_conv1d_2')(b)
     b = layers.Flatten(name='future_weather_flatten')(b)
     b = layers.Dropout(dropout, name='future_weather_dropout')(b)
 
@@ -1081,12 +1083,32 @@ def check_deployment_predictions_match_evaluation(meta, eval_pred_pu, n_windows=
 # -----------------------------------------------------------------------------
 # Optuna — ONE study for this (architecture, task); House 11 only.
 # -----------------------------------------------------------------------------
+# Resumable Optuna (frozen rule): persistent SQLite storage on Google Drive,
+# one study per (architecture, task). A disconnected Colab run resumes its study.
+OPTUNA_STUDY_NAME = f'{ARCH_KEY}_{TASK}'
+OPTUNA_STORAGE_URL = f"sqlite:///{EXPERIMENT_DIR / 'optuna_studies.db'}"
 study = optuna.create_study(
+    study_name=OPTUNA_STUDY_NAME,
+    storage=OPTUNA_STORAGE_URL,
+    load_if_exists=True,
     direction='minimize',
     sampler=optuna.samplers.TPESampler(seed=SEED),
     pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
 )
-study.optimize(objective, n_trials=OPTUNA_TRIALS, gc_after_trial=True)
+# A trial left RUNNING by a disconnected session never finished: mark it FAIL so it is
+# repeated. Only finished (COMPLETE or PRUNED) trials count towards OPTUNA_TRIALS.
+for stale in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
+    study.tell(stale.number, state=optuna.trial.TrialState.FAIL)
+    print(f'Optuna: interrupted trial {stale.number} marked FAIL and will be repeated.')
+n_finished = len(study.get_trials(
+    deepcopy=False,
+    states=(optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED),
+))
+n_remaining = max(0, OPTUNA_TRIALS - n_finished)
+print(f'Optuna study {OPTUNA_STUDY_NAME!r} ({OPTUNA_STORAGE_URL}): '
+      f'{n_finished} finished trials, {n_remaining} remaining.')
+if n_remaining > 0:
+    study.optimize(objective, n_trials=n_remaining, gc_after_trial=True)
 print('Best params:', study.best_params)
 study.trials_dataframe().to_csv(RUN_DIR / 'optuna_trials.csv', index=False)
 with open(RUN_DIR / 'best_hyperparameters.json', 'w') as f:
@@ -1230,6 +1252,8 @@ summary = {
     'feature_layout': 'future_weather (24, 8) + static (3,)',
     'target': TARGET, 'target_normalization': 'PV / Array_Rated_Power_W',
     'optuna_trials': OPTUNA_TRIALS,
+    'optuna_study_name': OPTUNA_STUDY_NAME,
+    'optuna_storage': OPTUNA_STORAGE_URL,
     'optuna_objective': 'House-11 daylight-masked MSE of the raw per-unit output (neural val_loss, no clipping)',
     'best_hyperparameters': best,
     'optuna_best_value': float(study.best_value),
