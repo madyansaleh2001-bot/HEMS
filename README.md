@@ -80,6 +80,20 @@ Then train the two comparison agents with the algorithm that scored best on the 
 
 For a shorter first try, add `--steps 300000`.
 
+Approximate time per 2 M-step training (measured here on 4 CPU cores; a standard Colab CPU runtime is probably
+about 1.5× slower):
+
+| Algorithm | Steps/s here | 2 M steps here | Colab estimate |
+|---|---|---|---|
+| A2C | ~2,700 | ~13 min | ~20 min |
+| PPO | ~2,000 | ~17 min | ~25–30 min |
+| DDQN | ~850 | ~40 min | ~1 h |
+| SAC-Discrete | ~400 | ~85 min | ~2 h |
+
+That is roughly 3.5–4 h per seed for the four algorithms, or 11–12 h for all 12 runs. Run one command per session if
+you need to: each run resumes from its `last.pt`. Run only one training per runtime, because two PyTorch processes on
+the same few cores slow each other down badly.
+
 ### 4. Test and scenario suite
 
 ```python
