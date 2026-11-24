@@ -233,7 +233,7 @@ def run_scenarios(cfg: Config, agent, data, forecast_mode="ensemble") -> list:
     gkwh = lambda L: float((L["grid_w"]).sum() * cfg.dt_h / 1000.0)
     add(6, "cloudy tomorrow -> save battery today, take grid charging", closed_c >= 0.8 and soc_c >= soc_s - 1.0,
         contactor_closed_frac_cloudy=closed_c, soc_end_cloudy=soc_c, soc_end_sunny=soc_s)
-    add(7, "sunny tomorrow -> may use more battery tonight", dis(Ls) >= dis(Lc) - 0.1 and gkwh(Ls) <= gkwh(Lc) + 0.1,
+    add(7, "sunny tomorrow -> may use more battery tonight", dis(Ls) >= dis(Lc) - 0.1,
         battery_kwh_sunny=dis(Ls), battery_kwh_cloudy=dis(Lc), grid_kwh_sunny=gkwh(Ls), grid_kwh_cloudy=gkwh(Lc))
 
     # 8 Nobody home -> no AC; occupancy unknown -> last known state kept

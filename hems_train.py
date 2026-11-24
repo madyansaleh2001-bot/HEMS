@@ -40,6 +40,14 @@ from hems_config import (Config, SelfTest, add_common_args, config_from_args, ma
 from hems_env import HEMSEnv, VecEnv, run_episodes
 
 
+def append_row(path: str, row: dict):
+    """Append a row to a CSV whose columns may grow over time (rewrites the small file with the union of columns)."""
+    new = pd.DataFrame([row])
+    if os.path.exists(path):
+        new = pd.concat([pd.read_csv(path), new], ignore_index=True)
+    new.to_csv(path, index=False)
+
+
 def selection_specs(cfg: Config, data) -> list:
     """Fixed 3-day episodes tiled over the selection period, each with its own fixed grid-scenario seed."""
     n = cfg.episode_steps
@@ -125,12 +133,12 @@ def train(cfg: Config, algo: str, seed: int, forecast: str = "ensemble", fresh: 
                **{f"train_{k}": float(eps[k].mean()) for k in ("reward", "trips", "rejected_per_day", "water_outage_min", "fridge_cut_min",
                                                              "discomfort_ch", "bill_usd_agent", "emergency_steps") if len(eps)},
                **{f"stat_{k}": v for k, v in agent.stats.items()}}
-        pd.DataFrame([row]).to_csv(log_tr, mode="a", header=not os.path.exists(log_tr), index=False)
+        append_row(log_tr, row)
         sel = evaluate_selection(agent, cfg, data_sel, specs, forecast)
         sel["steps"] = agent.total_steps
         improved = sel["select_reward"] > best["select_reward"]
         sel["best"] = improved
-        pd.DataFrame([sel]).to_csv(log_sel, mode="a", header=not os.path.exists(log_sel), index=False)
+        append_row(log_sel, sel)
         if improved:
             best = dict(sel)
             agent.save(os.path.join(run, "best.pt"), extra={"selection": sel, "forecast_mode": forecast, "algo": algo, "seed": seed}, full=False)
@@ -181,7 +189,8 @@ def selftest(out_root: str | None = None) -> bool:
                      if os.path.exists(os.path.join(run, f))]
             T.check(len(files) == 7, f"{algo}: run folder with settings, logs, best/last checkpoints", str(files))
             sel = pd.read_csv(os.path.join(run, "log_select.csv"))
-            T.check(len(sel) == 2 and agent.total_steps >= cfg.TRAIN_STEPS, f"{algo}: selection evaluated every EVAL_EVERY steps", f"{len(sel)} evals")
+            trl = pd.read_csv(os.path.join(run, "log_train.csv"))
+            T.check(len(sel) == 2 and len(trl) == 2 and agent.total_steps >= cfg.TRAIN_STEPS, f"{algo}: selection evaluated every EVAL_EVERY steps, logs readable", f"{len(sel)} evals")
             c = done["debug_counters"]
             T.check(c["emergency_steps"] > 0 and done["stored_all_in_control"] and done["stored"] == c["agent_steps"],
                     f"{algo}: emergencies happened and none reached a learning update", f"{c}, stored {done['stored']}")
