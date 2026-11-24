@@ -32,3 +32,10 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# Python / HEMS outputs
+__pycache__/
+*.pyc
+hems_drl_local/
+*.pt
+*.npz
