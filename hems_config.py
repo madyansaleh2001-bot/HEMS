@@ -222,6 +222,7 @@ GEN_SIZE_KVA = 0.0  # [user] set later if a generator is added
 GEN_COST_PER_H = 0.0  # [user] fuel cost per hour, set later
 GEN_LOOKAHEAD_H = 6.0  # [user] request judged in hindsight over the next 6 h of the same episode
 GEN_COMFORT_VIOLATION_H = 2.0  # [user] a comfort violation longer than 2 h while home makes a request right
+GEN_REWARD_AT_REQUEST = True  # [default] the hindsight judgement is credited to the request step (learners patch it in); False = paid at the judgement step
 
 # =====================================================================================
 # 11. Reward (order: safety > water > fridge > comfort > cost)
@@ -237,6 +238,7 @@ LOW_SOC_MARGIN = 40.0  # [user] low-battery margin threshold
 W_COST = -10.0  # [user] per $ of grid energy at the marginal tariff
 W_WASTED_PV = -0.5  # [user] per kWh of curtailed PV while the tank is not full
 W_SWITCH = -0.2  # [user] per contactor, pump or AC toggle
+SWITCH_PENALIZE_DEAD_CONTACTOR = False  # [default] contactor toggles while the grid is absent switch no current (no wear): not penalized, still counted in the metrics
 W_GEN_RIGHT_PER_H = 5.0  # [user] generator request right in hindsight, per request hour
 W_GEN_WRONG_BASE_PER_H = -2.0  # [user] generator request wrong in hindsight: -(GEN_COST_PER_H x 10) - 2 per request hour
 GEN_WRONG_COST_MULT = 10.0  # [user] multiplier of GEN_COST_PER_H in the wrong-request penalty
@@ -263,6 +265,10 @@ ALGOS = ["ppo", "sac", "ddqn", "a2c"]  # [user] PPO, SAC-Discrete, DDQN, A2C
 TRAIN_STEPS = 2_000_000  # [user] environment steps per training
 EVAL_EVERY = 100_000  # [default] steps between checkpoint evaluations on the selection split
 HIDDEN = [256, 256]  # [user] same MLP for all: 2 x 256, ReLU
+GEN_BANDIT_HEAD = True  # [default] generator request learned as the one-step bandit it is (regression of its hindsight reward); RL learns the 8 power-flow actions. False = RL over all 16
+GEN_EXPLORE = 0.05  # [default] training only: extra random generator requests so the head keeps seeing labels
+GEN_HEAD = {"lr": 1e-3, "batch": 256, "buffer": 50_000, "updates_per_1k_steps": 20}  # [default] generator head training
+FACTORED_GEN_HEAD = True  # [default] used only when GEN_BANDIT_HEAD is False: 16 outputs = 8 (contactor, pump, AC) + 2 (generator)
 GAMMA = 0.99  # [default] discount per 15-min step (horizon about 25 h)
 REWARD_SCALE = 0.05  # [default] reward multiplier inside the learners only (ranking unchanged)
 OBS_NORM_STEPS = 20_000  # [default] steps of training-split rollouts used to fit the state normalization

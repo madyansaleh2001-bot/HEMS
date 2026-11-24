@@ -52,11 +52,11 @@ FEATURE_GROUPS = {
     "battery": ["soc_pct", "batt_power_w", "soc_chg_15m", "soc_chg_1h", "batt_voltage_v", "soh", "h_to_soc35"],
     "pv_forecast": ["pv_now_w", "pv_last_hour_w"] + list(ff.FC_NAMES) + ["cloud_now"],
     "grid": ["grid_present", "contactor_closed", "h_since_grid_arrived", "h_since_grid_seen", "grid_kwh_month", "tariff_high"],
-    "water": ["tank_pct", "tank_chg_per_h", "pump_on", "pump_run_h", "pump_h_today"],
+    "water": ["tank_pct", "tank_chg_per_h", "pump_on", "pump_run_h", "pump_h_today", "pump_rest_h"],
     "comfort": ["t_in", "rh_in", "humidex_in", "humidex_thr", "humidex_excess", "t_out", "rh_out", "t_out_1_3h", "t_out_4_8h",
                 "rh_out_1_3h", "rh_out_4_8h", "ac_on", "ac_run_h", "occ_home", "occ_away", "occ_unknown", "occ_age_h",
                 "occ_effective_home", "discomfort_h"],
-    "loads": ["fridge_on", "freezer_on", "heater_on", "base_load_w", "total_load_w", "inverter_load_pct"],
+    "loads": ["fridge_on", "freezer_on", "heater_on", "heater_window", "base_load_w", "total_load_w", "inverter_load_pct"],
     "safety": ["last_rejected", "safe_mode", "emergency_mode", "inverter_fault", "pump_unavailable", "ac_unavailable",
                "user_override_contactor", "fridge_cut_active", "lv_shutdown"],
 }
@@ -313,6 +313,31 @@ def generate_exogenous(cfg: Config, data, s0: int, n: int, rng: np.random.Genera
                 reset=reset, events=events)
 
 
+def fit_grid_from_pzem(times, present) -> dict:
+    """Fit the grid model from PZEM logs (timestamps + grid-present flag, regular sampling).
+    Events still running at the start or end of the log are ignored (unknown length); overlapping arrivals
+    show up as one longer event, as in reality. The rate is drawn per episode from U(0, GRID_MAX_EVENTS_PER_DAY),
+    so GRID_MAX_EVENTS_PER_DAY = 2 x the fitted mean keeps the randomization centred on the fitted value."""
+    t = np.asarray(times, dtype="datetime64[ns]")
+    p = np.asarray(present, dtype=bool)
+    order = np.argsort(t)
+    t, p = t[order], p[order]
+    d = np.diff(np.concatenate([[0], p.astype(int), [0]]))
+    starts, ends = np.flatnonzero(d == 1), np.flatnonzero(d == -1)  # run i covers [starts[i], ends[i])
+    keep = (starts > 0) & (ends < len(p))
+    starts, ends = starts[keep], ends[keep]
+    durs = np.asarray([(t[e] - t[s_]) / np.timedelta64(1, "m") for s_, e in zip(starts, ends)])
+    days = max((t[-1] - t[0]) / np.timedelta64(1, "D"), 1e-9) if len(t) else 1e-9
+    rate = len(starts) / days
+    out = {"days": float(days), "events": int(len(starts)), "events_per_day": float(rate),
+           "duration_min_median": float(np.median(durs)) if len(durs) else None,
+           "duration_min_p05_p95": [float(np.percentile(durs, 5)), float(np.percentile(durs, 95))] if len(durs) else None,
+           "suggested": {"GRID_MAX_EVENTS_PER_DAY": round(2.0 * rate, 2)}}
+    if len(durs):
+        out["suggested"]["GRID_EVENT_MIN"] = [round(float(np.percentile(durs, 5))), round(float(np.percentile(durs, 95)))]
+    return out
+
+
 def random_emergency(cfg: Config, n: int, rng: np.random.Generator) -> dict:
     types = list(cfg.EMERGENCY_TYPES)
     p = np.array([cfg.EMERGENCY_TYPES[t] for t in types], dtype=float)
@@ -454,6 +479,7 @@ class HEMSEnv:
         self.disc_streak = 0
         self.gen_pending = []
         self.gen_reward_pending = 0.0
+        self.ep_id = getattr(self, "ep_id", -1) + 1
         self.time_s = 0.0
         self.bus = ActuatorBus()
         self.safety = SafetyController(cfg, self.bus, start_mode="agent", keep_log=self.keep_log)
@@ -643,10 +669,12 @@ class HEMSEnv:
         elif served < 1.0:
             fridge_cut_frac = 1.0 - served
         # toggles caused by the agent's decisions
-        toggles = 0
+        toggles, toggles_pen = 0, 0
         for ch, now in (("contactor", c_ex), ("pump", p_ex), ("ac", a_ex)):
             if now != self.prev_relays[ch] and ch not in ctx.user_fixed:
                 toggles += 1
+                dead = ch == "contactor" and not grid and not self.x["grid"][max(k - 1, 0)]
+                toggles_pen += 0 if (dead and not cfg.SWITCH_PENALIZE_DEAD_CONTACTOR) else 1
         # generator advisory (judged in hindsight over GEN_LOOKAHEAD_H)
         fridge_event = fridge_cut_frac > 0
         tank_event = self.tank < cfg.TANK_MIN
@@ -654,36 +682,41 @@ class HEMSEnv:
         if in_control and g_ex:
             self.gen_pending.append((k, k + int(cfg.GEN_LOOKAHEAD_H * 4)))
             self.metrics["gen_requests"] += 1
-        gen_r = 0.0
         right = cfg.W_GEN_RIGHT_PER_H * dt_h
         wrong = (cfg.W_GEN_WRONG_BASE_PER_H - cfg.GEN_COST_PER_H * cfg.GEN_WRONG_COST_MULT) * dt_h
-        keep = []
+        judged, keep = [], []
         for kr, dl in self.gen_pending:
             if fridge_event or tank_event or comfort_event:
-                gen_r += right
+                judged.append((self.ep_id, kr, right))
                 self.metrics["gen_right"] += 1
-                self.metrics["gen_judged"] += 1
             elif k + 1 >= dl:
-                gen_r += wrong
-                self.metrics["gen_judged"] += 1
+                judged.append((self.ep_id, kr, wrong))
             else:
                 keep.append((kr, dl))
         self.gen_pending = keep
         episode_end = k + 1 >= self.n_steps
         if episode_end and self.gen_pending:  # window cut by the episode end: judged on what was seen
-            gen_r += wrong * len(self.gen_pending)
-            self.metrics["gen_judged"] += len(self.gen_pending)
+            judged += [(self.ep_id, kr, wrong) for kr, _ in self.gen_pending]
             self.gen_pending = []
-        self.gen_reward_pending += gen_r
+        self.metrics["gen_judged"] += len(judged)
+        gen_r = sum(r_ for _, _, r_ in judged)
+        if cfg.GEN_REWARD_AT_REQUEST:
+            gen_step = 0.0  # credited to the request steps by the learners through info["gen_judged"]
+        else:
+            self.gen_reward_pending += gen_r
+            gen_step = self.gen_reward_pending if in_control else 0.0
         ev = {"trip": trip, "rejected": dec.rejected, "water_outage": tank_event, "fridge_cut": fridge_cut_frac,
               "discomfort_c": disc, "long_discomfort": long_disc and disc > 0, "soc_pct": self.soc, "cost_usd": cost_agent,
-              "wasted_pv_kwh": wasted, "toggles": toggles, "generator": self.gen_reward_pending if in_control else 0.0}
+              "wasted_pv_kwh": wasted, "toggles": toggles_pen, "generator": gen_step}
         total, terms = compute_reward(ev, cfg)
         if in_control:
-            self.gen_reward_pending = 0.0
+            if not cfg.GEN_REWARD_AT_REQUEST:
+                self.gen_reward_pending = 0.0
             reward = total
         else:
             reward = 0.0  # emergency steps never enter learning
+        if cfg.GEN_REWARD_AT_REQUEST:
+            terms["generator"] = gen_r  # logged at the judgement step; the reward belongs to the request steps
         # metrics
         M = self.metrics
         if self.track_monthly and self._ym[s] != self._cur_ym:
@@ -708,7 +741,7 @@ class HEMSEnv:
         M["toggles"] += toggles
         M["lv_shutdown_min"] += cfg.STEP_MIN * (1.0 - served) * (fl["mode"] in ("battery", "lv_off"))
         M["unserved_kwh"] += load_w * (1.0 - served) * dt_h / 1000.0
-        M["reward"] += reward
+        M["reward"] += reward + (gen_r if cfg.GEN_REWARD_AT_REQUEST else 0.0)
         M["user_override_steps"] += bool(ctx.user_fixed)
         M["pump_kwh"] += pump_w * served * dt_h / 1000.0
         M["ac_kwh"] += ac_w * served * dt_h / 1000.0
@@ -782,7 +815,8 @@ class HEMSEnv:
                 "proposed": proposal, "executed": dec.executed, "rejected": dec.rejected, "violations": dec.violations,
                 "terms": terms, "reward_total": total, "trip": trip, "trip_reason": why, "served": served,
                 "grid_kwh": g_kwh, "grid_kwh_user": user_kwh, "cost_usd": cost, "cost_usd_agent": cost_agent,
-                "shadow_action": None if in_control else a_agent, "alerts": dec.alerts}
+                "shadow_action": None if in_control else a_agent, "alerts": dec.alerts,
+                "ep_id": self.ep_id, "k": k, "gen_request": bool(in_control and g_ex), "gen_judged": judged}
         if episode_end:
             if self.track_monthly:
                 self._close_month()
@@ -858,6 +892,7 @@ class HEMSEnv:
         o[I["pump_on"]] = self.pump_on
         o[I["pump_run_h"]] = self.pump_run_min / 60.0
         o[I["pump_h_today"]] = self.pump_today_h
+        o[I["pump_rest_h"]] = self.pump_rest_left_min / 60.0
         # comfort
         rh_in = 100.0 * self.e_in / e_sat_hpa(self.t_in)
         hx = humidex(self.t_in, rh_in)
@@ -885,6 +920,7 @@ class HEMSEnv:
         o[I["fridge_on"]] = self.prev_relays["fridge"]
         o[I["freezer_on"]] = self.prev_relays["freezer"]
         o[I["heater_on"]] = self.heater_on
+        o[I["heater_window"]] = float(x["heater"][k] and x["grid"][k])  # the heater program will run now if connected
         o[I["base_load_w"]] = self.last_base_w
         o[I["total_load_w"]] = self.last_total_w
         o[I["inverter_load_pct"]] = self.last_inv_pct
@@ -947,7 +983,8 @@ class VecEnv:
             o, r, te, tr, info = e.step(int(a))
             if info["episode_end"]:
                 info["final_obs"] = o
-                self.completed.append(info["episode_metrics"])
+                if "episode_metrics" in info:
+                    self.completed.append(info["episode_metrics"])
                 o, i2 = e.reset(int(self.rng.integers(2 ** 31)))
                 info["reset_info"] = i2
             obs.append(o)
@@ -1131,6 +1168,13 @@ def selftest(out_root: str | None = None) -> bool:
                 f"{np.mean(ev_per_day):.2f}/day")
         T.check(0.03 < nogrid / 300 < 0.16, "grid: some episodes have no grid at all", f"{nogrid / 300:.3f}")
         T.check(np.all(np.abs(hh - 0.25) < 0.06), "grid arrivals spread over all hours (no schedule)", str(np.round(hh, 3)))
+        # grid model fitted from (synthetic) PZEM logs
+        e = HEMSEnv(cfg, data, mode="eval", seed=1)
+        e.reset(seed=21, options={"steps": 2800, "start": 0, "grid_rate": 1.0, "user_events": False})
+        tt = data.t_utc[: len(e.x["grid"])]
+        fit = fit_grid_from_pzem(tt, e.x["grid"])
+        T.check(abs(fit["events_per_day"] - 1.0) < 0.35 and 60 <= fit["duration_min_median"] <= 120 and fit["duration_min_p05_p95"][0] >= 59,
+                "PZEM fit recovers the rate and durations", str(fit))
         # emergency semantics
         e = HEMSEnv(cfg, data, mode="eval", seed=1)
         e.reset(seed=7, options={"faults": [{"type": "comm_loss", "start": 10, "duration": 3}], "user_events": False})
@@ -1180,6 +1224,13 @@ def selftest(out_root: str | None = None) -> bool:
         e.step(encode_action(0, 0, 0, 1))
         rs = [e.step(0)[4]["terms"]["generator"] for _ in range(30)]
         T.check(abs(sum(rs) - cfg.W_GEN_WRONG_BASE_PER_H * 0.25) < 1e-9, "needless generator request is wrong in hindsight (-2 per request hour)")
+        e.reset(seed=3, options={"start": night, "soc": 95.0, "grid_events": [], "user_events": False, "occupancy": [0] * 400})
+        i0 = e.step(encode_action(0, 0, 0, 1))[4]
+        later = [e.step(0) for _ in range(30)]
+        jd = [j for _, r_, _, _, inf in later for j in inf["gen_judged"]]
+        T.check(i0["gen_request"] and jd == [(i0["ep_id"], i0["k"], cfg.W_GEN_WRONG_BASE_PER_H * 0.25)]
+                and all(r_ == inf["reward_total"] for _, r_, _, _, inf in later) and all(inf["terms"]["generator"] == 0 or inf["gen_judged"] for *_, inf in later),
+                "generator judgement is reported for the request step (not mixed into later rewards)")
         # speed
         import time
         e = HEMSEnv(cfg, data, mode="train", seed=1)

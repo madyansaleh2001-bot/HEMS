@@ -11,6 +11,11 @@ hems_agents.py - PPO, SAC-Discrete, DDQN and A2C in one PyTorch framework, plus 
   * Emergency steps never enter learning: a transition is stored only when info["agent_in_control"] is True
     (not in the replay buffer for DDQN/SAC-Discrete, not in the rollout for PPO/A2C). The step where an
     emergency starts is truncated, so it bootstraps from the next state's value.
+  * Generator request (advisory, changes no power flow): with GEN_BANDIT_HEAD each algorithm learns the 8
+    power-flow actions (contactor, pump, AC) and a generator head (same 2 x 256 MLP) learns the hindsight reward
+    of a request by regression; the request is made when that expected reward is positive. The executed action is
+    still one of the 16. With GEN_BANDIT_HEAD = False the algorithm learns all 16 (factorized output layer) and the
+    hindsight reward is credited to the request step.
 
 Run in Colab:
     !python hems_agents.py --selftest     # toy-task learning checks for the 4 algorithms, save/load, emergency filter
@@ -47,6 +52,26 @@ def mlp(n_in, n_out, hidden):
         d = h
     layers.append(nn.Linear(d, n_out))
     return nn.Sequential(*layers)
+
+
+class Factored16(nn.Module):
+    """Same 2 x 256 ReLU MLP; its last layer gives 8 values for (contactor, pump, AC) and 2 for the generator request,
+    combined into the 16 actions as out[a] = base[a & 7] + gen[a >> 3]. Exact for Q-values and a product policy for
+    logits, because the advisory generator request changes no power flow (only its own hindsight reward)."""
+
+    def __init__(self, n_in, hidden):
+        super().__init__()
+        self.net = mlp(n_in, 10, hidden)
+
+    def forward(self, x):
+        y = self.net(x)
+        return y[..., :8].repeat(*([1] * (y.dim() - 1)), 2) + y[..., 8:].repeat_interleave(8, dim=-1)
+
+
+def action_net(n_in, cfg, n_out):
+    if n_out == N_ACTIONS and cfg.FACTORED_GEN_HEAD:
+        return Factored16(n_in, cfg.HIDDEN)
+    return mlp(n_in, n_out, cfg.HIDDEN)
 
 
 # =====================================================================================
@@ -122,6 +147,88 @@ class BaseAgent:
         self.debug_stored_in_control = []  # filled when debug=True (self-test)
         self._obs = None
         self._masks = None
+        self.patch = bool(cfg.GEN_REWARD_AT_REQUEST)
+        self.bandit = bool(cfg.GEN_BANDIT_HEAD)
+        self.n_pol = 8 if self.bandit else N_ACTIONS  # actions learned by the RL algorithm
+        if self.bandit:
+            self.gen_net = mlp(obs_dim, 1, cfg.HIDDEN).to(self.device)
+            self.gen_opt = torch.optim.Adam(self.gen_net.parameters(), lr=cfg.GEN_HEAD["lr"])
+            cap = int(cfg.GEN_HEAD["buffer"])
+            self.gen_o = np.zeros((cap, obs_dim), dtype=np.float32)
+            self.gen_r = np.zeros(cap, dtype=np.float32)
+            self.gen_n = 0
+            self.gen_ptr = 0
+            self._gen_pending = {}
+            self._gen_since = 0.0
+
+    # -- generator request (advisory) -------------------------------------------------
+    def _gen_nets(self):
+        return {"gen": self.gen_net} if self.bandit else {}
+
+    def _gen_opts(self):
+        return {"gen": self.gen_opt} if self.bandit else {}
+
+    @torch.no_grad()
+    def gen_value(self, obs_n):
+        """Expected hindsight reward of a generator request (per 15-min step)."""
+        return self.gen_net(self._t(obs_n)).squeeze(-1).cpu().numpy()
+
+    def _gen_bits(self, obs_n, explore: bool):
+        if not self.bandit:
+            return None
+        g = (self.gen_value(obs_n) > 0.0).astype(np.int64)
+        if explore:
+            g = np.where(self.rng.random(len(g)) < self.cfg.GEN_EXPLORE, 1, g)
+        return g
+
+    def _compose(self, pol, g, masks16=None):
+        if not self.bandit:
+            return pol
+        if masks16 is not None:  # request only where the composite action is allowed
+            g = g * np.asarray(masks16, dtype=bool)[np.arange(len(pol)), pol + 8]
+        return pol + 8 * g
+
+    def _pol_masks(self, masks):
+        if masks is None:
+            return None
+        masks = np.asarray(masks, dtype=bool)
+        return masks[..., :8] if self.bandit else masks  # validity never depends on the advisory bit
+
+    def _gen_observe(self, i, info, obs_n_i):
+        """Collect (state, hindsight reward) pairs of the requests for the generator head."""
+        if info.get("gen_request", False):
+            self._gen_pending[(i, info.get("ep_id", 0), info.get("k", 0))] = obs_n_i
+        for ep, kq, rg in info.get("gen_judged", ()):
+            o = self._gen_pending.pop((i, ep, kq), None)
+            if o is not None:
+                j = self.gen_ptr
+                self.gen_o[j], self.gen_r[j] = o, rg
+                self.gen_ptr = (j + 1) % len(self.gen_r)
+                self.gen_n = min(self.gen_n + 1, len(self.gen_r))
+
+    def _gen_train(self, env_steps):
+        if not self.bandit:
+            return
+        self._gen_since += env_steps * self.cfg.GEN_HEAD["updates_per_1k_steps"] / 1000.0
+        n_upd = int(self._gen_since)
+        self._gen_since -= n_upd
+        if self.gen_n < 32:
+            return
+        for _ in range(n_upd):
+            idx = self.rng.integers(0, self.gen_n, size=min(self.cfg.GEN_HEAD["batch"], self.gen_n))
+            loss = F.mse_loss(self.gen_net(self._t(self.gen_o[idx])).squeeze(-1), self._t(self.gen_r[idx]))
+            self.gen_opt.zero_grad()
+            loss.backward()
+            self.gen_opt.step()
+        if n_upd:
+            self.stats["gen_loss"] = loss.item()
+
+    # -- action selection shared by all algorithms ----------------------------------------
+    @torch.no_grad()
+    def act_batch(self, obs_raw, masks=None, deterministic=False):
+        obs_n = self.norm(obs_raw)
+        pol = self._select(obs_n, self._pol_masks(masks), deterministic)
+        return self._compose(pol, self._gen_bits(obs_n, explore=False), masks)
 
     # -- the clean deployment interface -------------------------------------------------
     @torch.no_grad()
@@ -186,19 +293,19 @@ class _OnPolicy(BaseAgent):
     def __init__(self, cfg, hp: dict, **kw):
         super().__init__(cfg, **kw)
         self.hp = dict(hp)
-        self.actor = mlp(self.obs_dim, N_ACTIONS, cfg.HIDDEN).to(self.device)
+        self.actor = action_net(self.obs_dim, cfg, self.n_pol).to(self.device)
         self.critic = mlp(self.obs_dim, 1, cfg.HIDDEN).to(self.device)
         self.opt = torch.optim.Adam(list(self.actor.parameters()) + list(self.critic.parameters()), lr=self.hp["lr"], eps=1e-5)
 
     def networks(self):
-        return {"actor": self.actor, "critic": self.critic}
+        return {"actor": self.actor, "critic": self.critic, **self._gen_nets()}
 
     def optimizers(self):
-        return {"opt": self.opt}
+        return {"opt": self.opt, **self._gen_opts()}
 
     @torch.no_grad()
-    def act_batch(self, obs_raw, masks=None, deterministic=False):
-        logits = self._mask_logits(self.actor(self._t(self.norm(obs_raw))), masks)
+    def _select(self, obs_n, masks, deterministic):
+        logits = self._mask_logits(self.actor(self._t(obs_n)), masks)
         if deterministic:
             return logits.argmax(-1).cpu().numpy()
         return torch.distributions.Categorical(logits=logits).sample().cpu().numpy()
@@ -217,13 +324,18 @@ class _OnPolicy(BaseAgent):
         return done_steps
 
     def _rollout_and_update(self, venv):
+        """Collect n_steps per env, then update on every transition whose reward is final. A transition that made a
+        generator request waits (with everything after it, to keep sequences contiguous) until the environment has
+        judged the request in hindsight and its reward has been credited to it."""
         hp, ne = self.hp, venv.n
-        buf = [{"o": [], "a": [], "lp": [], "v": [], "r": [], "d": [], "m": []} for _ in range(ne)]
-        tail_done = [True] * ne
+        if getattr(self, "_seq", None) is None or len(self._seq) != ne:
+            self._seq = [[] for _ in range(ne)]
+        patch = bool(self.cfg.GEN_REWARD_AT_REQUEST)
         ent_acc, nst = 0.0, 0
         for _ in range(hp["n_steps"]):
             obs_n = self.norm(self._obs)
-            masks = venv.action_masks() if self.use_mask else None
+            masks16 = venv.action_masks() if self.use_mask else None
+            masks = self._pol_masks(masks16)
             with torch.no_grad():
                 logits = self._mask_logits(self.actor(self._t(obs_n)), masks)
                 dist = torch.distributions.Categorical(logits=logits)
@@ -232,46 +344,63 @@ class _OnPolicy(BaseAgent):
                 ent_acc += float(dist.entropy().mean())
             a = a.cpu().numpy()
             v = self._value(obs_n)
-            nxt, r, term, trunc, infos = venv.step(a)
+            nxt, r, term, trunc, infos = venv.step(self._compose(a, self._gen_bits(obs_n, explore=True), masks16))
             nst += ne
-            boot_obs, boot_idx = [], []
+            boot_obs, boot_tr = [], []
             for i, info in enumerate(infos):
-                if not info["agent_in_control"]:
-                    continue  # emergency step: never part of the rollout
-                b = buf[i]
-                b["o"].append(obs_n[i]); b["a"].append(a[i]); b["lp"].append(lp[i]); b["v"].append(v[i])
-                b["r"].append(float(r[i]) * self.rscale)
-                b["d"].append(bool(term[i] or trunc[i]))
-                b["m"].append(masks[i] if masks is not None else None)
-                tail_done[i] = bool(term[i] or trunc[i])
-                if trunc[i] and not term[i]:
-                    boot_obs.append(info["final_obs"] if info["episode_end"] else nxt[i])
-                    boot_idx.append((i, len(b["r"]) - 1))
-                self._record(info)
+                if info["agent_in_control"]:  # emergency steps are never part of the rollout
+                    tr = {"o": obs_n[i], "a": a[i], "lp": lp[i], "v": float(v[i]), "r": float(r[i]) * self.rscale,
+                          "d": bool(term[i] or trunc[i]), "m": masks[i] if masks is not None else None,
+                          "key": (info.get("ep_id", 0), info.get("k", 0)),
+                          "ready": self.bandit or not (patch and info.get("gen_request", False))}
+                    self._seq[i].append(tr)
+                    if trunc[i] and not term[i]:
+                        boot_obs.append(info["final_obs"] if info["episode_end"] else nxt[i])
+                        boot_tr.append(tr)
+                    self._record(info)
+                if self.bandit:
+                    self._gen_observe(i, info, obs_n[i])
+                    continue
+                for ep, kq, rg in info.get("gen_judged", ()):  # hindsight judgement -> reward of the request step
+                    for tr in reversed(self._seq[i]):
+                        if tr["key"] == (ep, kq):
+                            tr["r"] += float(rg) * self.rscale
+                            tr["ready"] = True
+                            break
             if boot_obs:
                 bv = self._value(self.norm(np.stack(boot_obs)))
-                for (i, j), val in zip(boot_idx, bv):
-                    buf[i]["r"][j] += self.gamma * float(val)  # truncation: bootstrap instead of "end of the world"
+                for tr, val in zip(boot_tr, bv):
+                    tr["r"] += self.gamma * float(val)  # truncation: bootstrap instead of "end of the world"
             self._obs = nxt
         self.total_steps += nst
+        self._gen_train(nst)
         last_v = self._value(self.norm(self._obs))
         O, A, LP, ADV, RET, M = [], [], [], [], [], []
         lam = hp["gae_lambda"]
         for i in range(ne):
-            b = buf[i]
-            T = len(b["r"])
-            if T == 0:
+            seq = self._seq[i]
+            f = next((j for j, tr in enumerate(seq) if not tr["ready"]), len(seq))
+            use, self._seq[i] = seq[:f], seq[f:]
+            if not use:
                 continue
-            adv = np.zeros(T, dtype=np.float32)
-            nv = 0.0 if tail_done[i] else float(last_v[i])
+            if use[-1]["d"]:
+                nv = 0.0
+            elif self._seq[i]:
+                nv = self._seq[i][0]["v"]
+            else:
+                nv = float(last_v[i])
+            adv = np.zeros(len(use), dtype=np.float32)
             gae = 0.0
-            for t in range(T - 1, -1, -1):
-                nd = 0.0 if b["d"][t] else 1.0
-                delta = b["r"][t] + self.gamma * nv * nd - b["v"][t]
+            for t in range(len(use) - 1, -1, -1):
+                tr = use[t]
+                nd = 0.0 if tr["d"] else 1.0
+                delta = tr["r"] + self.gamma * nv * nd - tr["v"]
                 gae = delta + self.gamma * lam * nd * gae
                 adv[t] = gae
-                nv = b["v"][t]
-            O += b["o"]; A += b["a"]; LP += b["lp"]; ADV.append(adv); RET.append(adv + np.array(b["v"], dtype=np.float32)); M += b["m"]
+                nv = tr["v"]
+            vals = np.array([tr["v"] for tr in use], dtype=np.float32)
+            O += [tr["o"] for tr in use]; A += [tr["a"] for tr in use]; LP += [tr["lp"] for tr in use]; M += [tr["m"] for tr in use]
+            ADV.append(adv); RET.append(adv + vals)
         if not O:
             return nst
         O = self._t(np.stack(O)); A = torch.as_tensor(np.array(A), device=self.device, dtype=torch.long)
@@ -374,7 +503,8 @@ class _OffPolicy(BaseAgent):
     def __init__(self, cfg, hp, **kw):
         super().__init__(cfg, **kw)
         self.hp = dict(hp)
-        self.buffer = ReplayBuffer(self.hp["buffer"], self.obs_dim, N_ACTIONS, self.use_mask)
+        self.buffer = ReplayBuffer(self.hp["buffer"], self.obs_dim, self.n_pol, self.use_mask)
+        self._pending = {}  # transitions with a generator request waiting for the hindsight judgement
 
     def algo_state(self):
         return {"buffer": self.buffer.state()} if self.cfg.SAVE_REPLAY_BUFFER else {}
@@ -386,24 +516,41 @@ class _OffPolicy(BaseAgent):
     def train_steps(self, venv, n_steps: int):
         if self._obs is None:
             self._obs, _ = venv.reset()
-            self._masks = venv.action_masks() if self.use_mask else None
+            self._masks16 = venv.action_masks() if self.use_mask else None
+            self._masks = self._pol_masks(self._masks16)
         done = 0
         vstep = 0
         while done < n_steps:
             obs_n = self.norm(self._obs)
             a = self._explore(obs_n, self._masks)
-            nxt, r, term, trunc, infos = venv.step(a)
-            masks2 = venv.action_masks() if self.use_mask else None
+            nxt, r, term, trunc, infos = venv.step(self._compose(a, self._gen_bits(obs_n, explore=True), getattr(self, "_masks16", None)))
+            masks16_2 = venv.action_masks() if self.use_mask else None
+            masks2 = self._pol_masks(masks16_2)
             for i, info in enumerate(infos):
-                if not info["agent_in_control"]:
-                    continue  # emergency step: never stored in the replay buffer
-                o2 = info["final_obs"] if info["episode_end"] else nxt[i]
-                m2 = (info.get("action_mask") if info["episode_end"] else (masks2[i] if masks2 is not None else None))
-                self.buffer.add(obs_n[i], a[i], float(r[i]) * self.rscale, self.norm(o2), float(term[i]), m2)
-                self._record(info)
-            self._obs, self._masks = nxt, masks2
+                if info["agent_in_control"]:  # emergency steps are never stored in the replay buffer
+                    o2 = info["final_obs"] if info["episode_end"] else nxt[i]
+                    if masks2 is None:
+                        m2 = None
+                    else:
+                        m2 = self._pol_masks(info["action_mask"]) if (info["episode_end"] and "action_mask" in info) else masks2[i]
+                    tr = [obs_n[i], a[i], float(r[i]) * self.rscale, self.norm(o2), float(term[i]), m2]
+                    if self.patch and not self.bandit and info.get("gen_request", False):
+                        self._pending[(i, info.get("ep_id", 0), info.get("k", 0))] = tr  # waits for its hindsight judgement
+                    else:
+                        self.buffer.add(*tr)
+                    self._record(info)
+                if self.bandit:
+                    self._gen_observe(i, info, obs_n[i])
+                    continue
+                for ep, kq, rg in info.get("gen_judged", ()):
+                    tr = self._pending.pop((i, ep, kq), None)
+                    if tr is not None:
+                        tr[2] += float(rg) * self.rscale
+                        self.buffer.add(*tr)
+            self._obs, self._masks, self._masks16 = nxt, masks2, masks16_2
             done += venv.n
             self.total_steps += venv.n
+            self._gen_train(venv.n)
             vstep += 1
             if self.buffer.n >= self.hp["learning_starts"] and vstep % self.hp["train_every"] == 0:
                 for _ in range(self.hp["grad_steps"]):
@@ -417,24 +564,24 @@ class DDQNAgent(_OffPolicy):
 
     def __init__(self, cfg, **kw):
         super().__init__(cfg, cfg.DDQN, **kw)
-        self.q = mlp(self.obs_dim, N_ACTIONS, cfg.HIDDEN).to(self.device)
+        self.q = action_net(self.obs_dim, cfg, self.n_pol).to(self.device)
         self.q_t = copy.deepcopy(self.q)
         self.opt = torch.optim.Adam(self.q.parameters(), lr=self.hp["lr"])
         self.eps_total = cfg.TRAIN_STEPS
 
     def networks(self):
-        return {"q": self.q, "q_t": self.q_t}
+        return {"q": self.q, "q_t": self.q_t, **self._gen_nets()}
 
     def optimizers(self):
-        return {"opt": self.opt}
+        return {"opt": self.opt, **self._gen_opts()}
 
     def epsilon(self):
         frac = min(1.0, self.total_steps / max(1.0, self.hp["eps_frac"] * self.eps_total))
         return self.hp["eps_start"] + frac * (self.hp["eps_end"] - self.hp["eps_start"])
 
     @torch.no_grad()
-    def act_batch(self, obs_raw, masks=None, deterministic=False):
-        q = self._mask_logits(self.q(self._t(self.norm(obs_raw))), masks)
+    def _select(self, obs_n, masks, deterministic):
+        q = self._mask_logits(self.q(self._t(obs_n)), masks)
         return q.argmax(-1).cpu().numpy()
 
     @torch.no_grad()
@@ -444,7 +591,7 @@ class DDQNAgent(_OffPolicy):
         eps = self.epsilon()
         for i in range(len(a)):
             if self.rng.random() < eps:
-                valid = np.flatnonzero(masks[i]) if masks is not None else np.arange(N_ACTIONS)
+                valid = np.flatnonzero(masks[i]) if masks is not None else np.arange(self.n_pol)
                 a[i] = int(self.rng.choice(valid))
         return a
 
@@ -473,22 +620,22 @@ class SACDAgent(_OffPolicy):
     def __init__(self, cfg, **kw):
         super().__init__(cfg, cfg.SAC, **kw)
         H = cfg.HIDDEN
-        self.actor = mlp(self.obs_dim, N_ACTIONS, H).to(self.device)
-        self.q1 = mlp(self.obs_dim, N_ACTIONS, H).to(self.device)
-        self.q2 = mlp(self.obs_dim, N_ACTIONS, H).to(self.device)
+        self.actor = action_net(self.obs_dim, cfg, self.n_pol).to(self.device)
+        self.q1 = action_net(self.obs_dim, cfg, self.n_pol).to(self.device)
+        self.q2 = action_net(self.obs_dim, cfg, self.n_pol).to(self.device)
         self.q1_t, self.q2_t = copy.deepcopy(self.q1), copy.deepcopy(self.q2)
         self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-        self.target_entropy = self.hp["target_entropy_ratio"] * np.log(N_ACTIONS)
+        self.target_entropy = self.hp["target_entropy_ratio"] * np.log(self.n_pol)
         lr = self.hp["lr"]
         self.opt_pi = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.opt_q = torch.optim.Adam(list(self.q1.parameters()) + list(self.q2.parameters()), lr=lr)
         self.opt_a = torch.optim.Adam([self.log_alpha], lr=lr)
 
     def networks(self):
-        return {"actor": self.actor, "q1": self.q1, "q2": self.q2, "q1_t": self.q1_t, "q2_t": self.q2_t}
+        return {"actor": self.actor, "q1": self.q1, "q2": self.q2, "q1_t": self.q1_t, "q2_t": self.q2_t, **self._gen_nets()}
 
     def optimizers(self):
-        return {"pi": self.opt_pi, "q": self.opt_q, "alpha": self.opt_a}
+        return {"pi": self.opt_pi, "q": self.opt_q, "alpha": self.opt_a, **self._gen_opts()}
 
     def algo_state(self):
         d = super().algo_state()
@@ -502,8 +649,8 @@ class SACDAgent(_OffPolicy):
                 self.log_alpha.fill_(d["log_alpha"])
 
     @torch.no_grad()
-    def act_batch(self, obs_raw, masks=None, deterministic=False):
-        logits = self._mask_logits(self.actor(self._t(self.norm(obs_raw))), masks)
+    def _select(self, obs_n, masks, deterministic):
+        logits = self._mask_logits(self.actor(self._t(obs_n)), masks)
         if deterministic:
             return logits.argmax(-1).cpu().numpy()
         return torch.distributions.Categorical(logits=logits).sample().cpu().numpy()
@@ -600,8 +747,10 @@ def load_agent(path: str, cfg: Config | None = None, device=None, full: bool = F
 # Self-test on a toy task (known optimal action), plus the emergency filter
 # =====================================================================================
 class ToyEnv:
-    """Contextual task: obs shows a target in 0..3; reward 1 for action target*4+1 (else 0). 10% of steps are
-    'emergency' steps (agent_in_control False, reward 0) that must never reach a learning update."""
+    """Contextual task: obs shows a target in 0..3; reward 1 for (action & 7) == target*2+1. Actions >= 8 carry a
+    'generator request' judged two steps later: right (+1) when the target was 0, wrong (-1) otherwise. Optimal
+    action: target*2+1, plus 8 when the target is 0.
+    10% of steps are 'emergency' steps (agent_in_control False, reward 0) that must never reach a learning update."""
 
     def __init__(self, seed, obs_dim=12):
         self.rng = np.random.default_rng(seed)
@@ -621,13 +770,24 @@ class ToyEnv:
 
     def step(self, a):
         in_ctrl = not self.emerg
-        r = (1.0 if a == self.tgt * 4 + 1 else 0.0) if in_ctrl else 0.0
+        r = (1.0 if (a & 7) == self.tgt * 2 + 1 else 0.0) if in_ctrl else 0.0
+        k = self.k
         self.k += 1
         end = self.k >= 10
         nxt_emerg = (not end) and self.rng.random() < 0.1
         trunc = end or (in_ctrl and nxt_emerg)
         self.emerg = nxt_emerg
-        return self._o(), r, False, trunc, {"agent_in_control": in_ctrl, "episode_end": end}
+        info = {"agent_in_control": in_ctrl, "episode_end": end, "ep_id": getattr(self, "ep", 0), "k": k,
+                "gen_request": bool(in_ctrl and a >= 8), "gen_judged": []}
+        self.pend = getattr(self, "pend", [])
+        if info["gen_request"]:
+            self.pend.append((info["ep_id"], k, self.tgt))
+        due = [p for p in self.pend if p[1] <= k - 2 or end]
+        self.pend = [p for p in self.pend if p not in due]
+        info["gen_judged"] = [(e, kk, 1.0 if t == 0 else -1.0) for e, kk, t in due]
+        if end:
+            self.ep = getattr(self, "ep", 0) + 1
+        return self._o(), r, False, trunc, info
 
     def action_mask(self):
         return np.ones(N_ACTIONS, dtype=bool)
@@ -644,12 +804,16 @@ def selftest(out_root: str | None = None) -> bool:
                       DEVICE="cpu")
     set_global_seed(cfg.SEED)
     d = 12
-    for algo, steps in (("ppo", 16000), ("a2c", 20000), ("ddqn", 8000), ("sac", 8000)):
-        ag = make_agent(algo, cfg, seed=cfg.SEED, obs_dim=d)
+    runs = [(a, s_, True) for a, s_ in (("ppo", 16000), ("a2c", 20000), ("ddqn", 8000), ("sac", 8000))] + [("ddqn", 8000, False), ("ppo", 16000, False)]
+    for algo, steps, bandit in runs:
+        c_run = cfg.replace(GEN_BANDIT_HEAD=bandit)
+        ag = make_agent(algo, c_run, seed=cfg.SEED, obs_dim=d)
+        algo = algo if bandit else algo + " (16 actions, no generator head)"
         nets = ag.networks()
         first = next(iter(nets.values()))
-        lin = [m for m in first if isinstance(m, nn.Linear)]
-        T.check([l.out_features for l in lin[:-1]] == [256, 256] and all(isinstance(m, (nn.Linear, nn.ReLU)) for m in first),
+        seq = first.net if isinstance(first, Factored16) else first
+        lin = [m for m in seq if isinstance(m, nn.Linear)]
+        T.check([l.out_features for l in lin[:-1]] == [256, 256] and all(isinstance(m, (nn.Linear, nn.ReLU)) for m in seq),
                 f"{algo}: MLP 2 x 256 ReLU")
         ag.debug = True
         venv = VecEnv([ToyEnv(100 + i, d) for i in range(4)], seed=1)
@@ -666,18 +830,23 @@ def selftest(out_root: str | None = None) -> bool:
         hits = 0
         for _ in range(400):
             o, _ = probe.reset()
-            hits += int(ag.act(o) == probe.tgt * 4 + 1)
-        T.check(hits / 400 > 0.9, f"{algo}: learns the toy task", f"accuracy {hits / 400:.2f}")
+            hits += int(ag.act(o) == probe.tgt * 2 + 1 + (8 if probe.tgt == 0 else 0))
+        T.check(hits / 400 > 0.9, f"{algo}: learns the toy task, incl. the delayed request reward", f"accuracy {hits / 400:.2f}")
         stored = ag.debug_stored_in_control
         T.check(len(stored) > 0 and all(stored) and len(stored) == env_counter["in_ctrl"],
                 f"{algo}: no emergency step reached a learning update", f"stored {len(stored)}, in-control {env_counter['in_ctrl']}")
         # save / load round trip gives the same actions
-        tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"_tmp_{algo}.pt")
+        tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_agent.pt")
         ag.save(tmp)
-        ag2 = load_agent(tmp, cfg)
+        ag2 = load_agent(tmp, c_run)
         os.remove(tmp)
         obs = np.random.default_rng(0).normal(size=(50, d)).astype(np.float32)
         T.check(np.array_equal(ag.act_batch(obs, deterministic=True), ag2.act_batch(obs, deterministic=True)), f"{algo}: save/load keeps the policy")
+    # factorized head: out[a] = base[a & 7] + gen[a >> 3]
+    fh = Factored16(d, [256, 256])
+    x = torch.randn(5, d)
+    y, raw = fh(x), fh.net(x)
+    T.check(all(torch.allclose(y[:, a], raw[:, a & 7] + raw[:, 8 + (a >> 3)]) for a in range(16)), "factorized head combines 8 + 2 outputs into the 16 actions")
     # masks
     ag = make_agent("ppo", cfg.replace(USE_ACTION_MASK=True), seed=1, obs_dim=d)
     m = np.zeros(N_ACTIONS, dtype=bool)

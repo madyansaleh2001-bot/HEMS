@@ -432,8 +432,8 @@ def context_from_obs(o: dict, cfg: Config) -> SafetyContext:
     return SafetyContext(
         grid_present=o["grid_present"] > 0.5, soc=float(o["soc_pct"]), tank=float(o["tank_pct"]),
         contactor_on=int(o["contactor_closed"] > 0.5), pump_on=int(o["pump_on"] > 0.5), ac_on=int(o["ac_on"] > 0.5),
-        pump_run_s=float(o["pump_run_h"]) * 3600.0, pump_rest_left_s=0.0, ac_off_s=1e9,
-        heater_request=o["heater_on"] > 0.5, r4_cut_active=o["fridge_cut_active"] > 0.5,
+        pump_run_s=float(o["pump_run_h"]) * 3600.0, pump_rest_left_s=float(o.get("pump_rest_h", 0.0)) * 3600.0, ac_off_s=1e9,
+        heater_request=o.get("heater_window", o["heater_on"]) > 0.5, r4_cut_active=o["fridge_cut_active"] > 0.5,
         base_va=float(o["base_load_w"]) / cfg.BASE_PF, freezer_user_on=o["freezer_on"] > 0.5 or o["fridge_cut_active"] > 0.5,
         pump_unavailable=o["pump_unavailable"] > 0.5, ac_unavailable=o["ac_unavailable"] > 0.5,
         user_fixed={"contactor": 1} if o["user_override_contactor"] > 0.5 else {}, dt_s=cfg.STEP_MIN * 60.0)

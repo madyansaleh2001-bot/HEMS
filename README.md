@@ -138,7 +138,20 @@ Every step also runs on generated stand-in data, which is useful for checking th
   inverter's 10 % / 70 % switching thresholds only matter in SBU mode and are not used. A trip (manual cut-off curve,
   including motor starts and the grid-loss transient) is a 30-minute blackout and the largest penalty.
 - **Generator request.** It changes no power flow. It is judged after 6 h, or earlier as soon as a fridge cut, a dry
-  tank or more than 2 h of discomfort happens. The reward is paid at that time.
+  tank or more than 2 h of discomfort happens. The judged reward (+5 or −2 per request hour) belongs to the step that
+  made the request (`GEN_REWARD_AT_REQUEST`). It is not paid at a later step, where it would be mixed in with other
+  decisions.
+- **Generator head** (`GEN_BANDIT_HEAD = True`, the default). The request is a one-step bandit: it only earns its own
+  hindsight reward. Each algorithm therefore learns the 8 power-flow actions (contactor, pump, AC), and a generator head
+  (the same 2×256 ReLU MLP) learns the expected hindsight reward of a request by regression on the judged requests.
+  The agent requests when that value is positive, which is the break-even of the reward weights (right about 29 % of
+  the time or more). The executed action, and `act(state)`, are still one of the 16 combinations. This was a
+  validation finding: learned as one of 16 actions, the request's −0.5 per step signal was lost in the noise of the
+  action values, and the agents requested on 30–65 % of steps while being right only 6–20 % of the time. With
+  `GEN_BANDIT_HEAD = False` each algorithm learns all 16 actions through a factorized output layer
+  (`FACTORED_GEN_HEAD`), with the judged reward credited to the request step.
+- **Switching penalty.** A contactor toggle while the grid is absent carries no current and causes no wear, so it is
+  counted in the metrics but not penalized (`SWITCH_PENALIZE_DEAD_CONTACTOR = False`).
 - **Timestamps.** The dataset is UTC (checked against `Solar_Zenith_rad`). Hours, nights, schedules and calendar
   months use `Asia/Beirut` local time, and the DST switch at midnight is handled.
 - **Rule-based baseline.** It uses the master prompt's rules, plus small hysteresis bands so it does not toggle every
